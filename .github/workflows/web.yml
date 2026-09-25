@@ -1,0 +1,103 @@
+# ─────────────────────────────────────────────────────────────────
+# Ceny a web — celá automatizace na jednom místě
+#
+# Každý den:  stáhne ceny z OTE → otestuje kód → přestaví web → zveřejní
+# Při změně:  totéž, když nahraješ nový kód
+# Při chybě:  GitHub ti pošle e-mail, web běží dál s posledními daty
+#
+# Časy jsou v UTC (GitHub jinak neumí):
+#   12:40 UTC = 14:40 letní čas / 13:40 zimní čas
+#   16:10 UTC = 18:10 letní čas / 17:10 zimní čas (druhý pokus)
+# ─────────────────────────────────────────────────────────────────
+name: Ceny a web
+
+on:
+  schedule:
+    - cron: '40 12 * * *'
+    - cron: '10 16 * * *'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # uložit nasbíraná data zpět do repozitáře
+  pages: write      # zveřejnit web
+  id-token: write
+
+concurrency:
+  group: web
+  cancel-in-progress: false
+
+jobs:
+  sestaveni:
+    runs-on: ubuntu-latest
+    outputs:
+      sber: ${{ steps.sber.outcome }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      # Když testy neprojdou, dál se nepokračuje a na webu zůstane
+      # poslední funkční verze.
+      - name: Testy
+        run: npm test
+
+      # Sběr může selhat (OTE neodpovídá, ceny ještě nejsou). Web se
+      # i tak přestaví se staršími daty a na konci přijde e-mail.
+      - name: Sběr cen z OTE
+        id: sber
+        continue-on-error: true
+        run: npm run sber
+
+      - name: Uložení nasbíraných dat
+        run: |
+          git config user.name "sber-cen"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add public/data
+          if git diff --cached --quiet; then
+            echo "Žádná nová data."
+          else
+            git commit -m "Ceny $(TZ=Europe/Prague date +%F)"
+            git pull --rebase origin main
+            git push
+          fi
+
+      - name: Sestavení webu
+        run: npm run build
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  nasazeni:
+    needs: sestaveni
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.nasazeni.outputs.page_url }}
+    steps:
+      - id: nasazeni
+        uses: actions/deploy-pages@v4
+
+      - name: Hlášení, že sběr selhal
+        if: needs.sestaveni.outputs.sber != 'success'
+        run: |
+          echo "::error::Sběr cen z OTE selhal. Web běží dál se staršími daty. Detail je v kroku Sběr cen z OTE."
+          exit 1
+
+  # Po Novém roce připomene, že je potřeba aktualizovat ceny distribuce.
+  kontrola-cen:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Jsou ceny distribuce pro letošní rok?
+        run: npm run kontrola
