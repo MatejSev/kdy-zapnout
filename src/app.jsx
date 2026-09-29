@@ -5,8 +5,12 @@ import {
 import {
   toFinalPrices, optimize, actionFor, odpocet, dayCharacter, buildIcs, isoDay,
   cheapestWindow, oknoPopis, tier, hoursLabel, pad, dni, czDate, backtest,
-  PROFILY, VYCHOZI_PROFIL,
+  PROFILY, VYCHOZI_PROFIL, mesicniPrehled, csvHodiny, csvDny,
 } from "./logika.js";
+import {
+  PREMIUM_CENA, PLATBA_URL, FORMULAR_URL, GOATCOUNTER_KOD, DODAVATELE,
+} from "./nastaveni.js";
+import { FUNKCE, jePremium, jeZdarmaRezim } from "./premium.js";
 
 // ═══════════════════════════════════════════════════════════════
 // Kdy zapnout — plánovač spotřeby podle spotové ceny
@@ -34,7 +38,24 @@ const DEFAULT_CFG = {
   distributor: "CEZ", rate: "D02d", margin: 0, marginPct: 0,
   systemFees: SYSTEM_FEES, kwp: 0, feedIn: 0.6, flatPrice: null,
   baseLoadPerHour: 0.3, ntHours: null,
+  dodavatel: "spot", // "spot" = bez přirážky, "vlastni" = zadaná ručně, jinak id z DODAVATELE
 };
+
+/** Přirážka dodavatele, která se opravdu použije ve výpočtu. */
+function efektivniMarze(cfg) {
+  if (cfg.dodavatel === "vlastni") return Number(cfg.margin) || 0;
+  const d = DODAVATELE.find((x) => x.id === cfg.dodavatel);
+  return d ? d.marze : 0;
+}
+
+function stahnoutSoubor(obsah, nazev, typ) {
+  const blob = new Blob([obsah], { type: typ });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = nazev;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 
 function stahnoutIcs(plan, dateIso) {
   const blob = new Blob([buildIcs(plan, dateIso)], { type: "text/calendar;charset=utf-8" });
@@ -71,7 +92,6 @@ export default function App() {
   const [tab, setTab] = useState("spotrebice");
   const [editing, setEditing] = useState(null);
   const [showMethod, setShowMethod] = useState(false);
-  const [premium, setPremium] = useState(false);
   const now = useNow(30000);
   const refreshKey = Math.floor(now.getTime() / 1800000) + ":" + isoDay(0);
 
@@ -87,6 +107,16 @@ export default function App() {
     } catch { /* poškozené, jedeme na výchozím */ }
   }, []);
   const uloz = (p, c, a) => store.set(KLIC, JSON.stringify({ profil: p, cfg: c, appliances: a }));
+
+  // Měření návštěvnosti, jen když je v nastaveni.js vyplněný kód.
+  useEffect(() => {
+    if (!GOATCOUNTER_KOD || document.querySelector("script[data-goatcounter]")) return;
+    const sc = document.createElement("script");
+    sc.async = true;
+    sc.src = "https://gc.zgo.at/count.js";
+    sc.dataset.goatcounter = `https://${GOATCOUNTER_KOD}.goatcounter.com/count`;
+    document.head.appendChild(sc);
+  }, []);
 
   // Data se načtou samy a pak každých 30 minut. Při chybě za minutu znovu.
   useEffect(() => {
@@ -116,8 +146,9 @@ export default function App() {
       .map(([date, v]) => ({ date, ...v }))
     : [], [data]);
 
-  const todayPrices = useMemo(() => dnesD ? toFinalPrices(dnesD.eur, { ...cfg, eurCzk: dnesD.eurCzk }) : null, [dnesD, cfg]);
-  const tomorrowPrices = useMemo(() => zitraD ? toFinalPrices(zitraD.eur, { ...cfg, eurCzk: zitraD.eurCzk }) : null, [zitraD, cfg]);
+  const cfgEff = useMemo(() => ({ ...cfg, margin: efektivniMarze(cfg) }), [cfg]);
+  const todayPrices = useMemo(() => dnesD ? toFinalPrices(dnesD.eur, { ...cfgEff, eurCzk: dnesD.eurCzk }) : null, [dnesD, cfgEff]);
+  const tomorrowPrices = useMemo(() => zitraD ? toFinalPrices(zitraD.eur, { ...cfgEff, eurCzk: zitraD.eurCzk }) : null, [zitraD, cfgEff]);
   const isToday = day === "today" || !tomorrowPrices;
   const prices = isToday ? todayPrices : tomorrowPrices;
   const pvDne = (isToday ? dnesD : zitraD)?.pv ?? [];
@@ -127,9 +158,9 @@ export default function App() {
     [prices, pv, baseLoad, cfg.feedIn, appliances]);
 
   // úspory ze skutečné historie: pro zvolené nastavení i pro každou předvolbu
-  const bt = useMemo(() => backtest(historie, cfg, appliances), [historie, cfg, appliances]);
+  const bt = useMemo(() => backtest(historie, cfgEff, appliances), [historie, cfgEff, appliances]);
   const btProfily = useMemo(() => Object.fromEntries(
-    Object.entries(PROFILY).map(([k, p]) => [k, backtest(historie, cfg, p.appliances)])), [historie, cfg]);
+    Object.entries(PROFILY).map(([k, p]) => [k, backtest(historie, cfgEff, p.appliances)])), [historie, cfgEff]);
 
   const active = opt ? opt.plan.filter((p) => !p.infeasible) : [];
   const shownDate = isToday ? isoDay(0) : isoDay(1);
@@ -211,6 +242,15 @@ export default function App() {
         </section>
       )}
 
+      <PremiumBlok id="odber">
+        <KalendarOdber profil={profil} />
+      </PremiumBlok>
+
+      <PremiumBlok id="historie">
+        <Historie bt={bt} historie={historie} cfgEff={cfgEff}
+          todayPrices={todayPrices} tomorrowPrices={tomorrowPrices} />
+      </PremiumBlok>
+
       <div className="custHead">
         <h2 className="secHead">Přizpůsobit podle sebe</h2>
         <p>
@@ -220,7 +260,7 @@ export default function App() {
         </p>
       </div>
       <nav className="tabs">
-        {[["spotrebice", "Spotřebiče"], ["cena", "Můj tarif"], ["premium", "Předplatné"]].map(([k, l]) => (
+        {[["spotrebice", "Spotřebiče"], ["cena", "Můj tarif"], ["premium", "Co všechno umí"]].map(([k, l]) => (
           <button key={k} className={tab === k ? "tab tabOn" : "tab"} onClick={() => setTab(k)}>{l}</button>
         ))}
       </nav>
@@ -230,8 +270,8 @@ export default function App() {
             setEditing={setEditing} toggle={toggle} patchApp={patchApp}
             remove={(id) => setApps(appliances.filter((a) => a.id !== id))} add={addApp} />
         )}
-        {tab === "cena" && prices && <PriceTab cfg={cfg} update={update} prices={prices} />}
-        {tab === "premium" && <Premium bt={bt} premium={premium} setPremium={setPremium} />}
+        {tab === "cena" && prices && <PriceTab cfg={cfg} update={update} prices={prices} eurCzk={dnesD?.eurCzk} />}
+        {tab === "premium" && <Premium bt={bt} />}
       </main>
 
       <footer className="foot">
@@ -239,7 +279,14 @@ export default function App() {
           Úspory jsou modelové, ne zaručené: počítají se ze skutečných cen, ale z typické
           spotřeby spotřebičů. Záleží na tvé skutečné spotřebě, sazbě a smlouvě s dodavatelem.
         </p>
-        <p>Zdroje: spotové ceny OTE, kurz ČNB, předpověď slunce Open-Meteo, ceníky distribuce 2026.</p>
+        <p>
+          Spotová cena je pro všechny dodavatele stejná, vzniká na denním trhu OTE. Dodavatelé
+          se liší jen přirážkou, kterou si můžeš nastavit v Můj tarif.
+        </p>
+        <p>Zdroje: spotové ceny OTE (záložně ENTSO-E), kurz ČNB, předpověď slunce Open-Meteo, ceníky distribuce 2026.</p>
+        {FORMULAR_URL && (
+          <p><a className="footLink" href={FORMULAR_URL} target="_blank" rel="noopener">Napiš nám, co ti chybí nebo co nefunguje</a></p>
+        )}
       </footer>
     </div>
   );
@@ -247,18 +294,19 @@ export default function App() {
 
 // ═══ Hlavička se stavem dat ════════════════════════════════════
 function Hlavicka({ mode, data, dnes, now }) {
+  const zdroj = dnes?.src === "ENTSO-E" ? "ENTSO-E (záloha)" : "OTE";
   let stav;
   if (mode === "loading") stav = <span className="live liveLoad"><i className="dot" />Načítám ceny</span>;
   else if (!data) stav = <span className="live liveDemo"><i className="dot" />Ceny nedostupné</span>;
   else if (!dnes) stav = <span className="live liveDemo"><i className="dot" />Dnešní ceny zatím chybí</span>;
-  else if (!data.updatedAt) stav = <span className="live liveOn"><i className="dot" />Ceny z OTE</span>;
+  else if (!data.updatedAt) stav = <span className="live liveOn"><i className="dot" />Ceny z {zdroj}</span>;
   else {
     const t = new Date(data.updatedAt);
     const min = Math.round((now - t) / 60000);
     const kdy = min < 60 ? `před ${Math.max(1, min)} min` : min < 60 * 24
       ? `dnes ve ${t.getHours()}:${String(t.getMinutes()).padStart(2, "0")}`
       : `${t.getDate()}. ${t.getMonth() + 1}.`;
-    stav = <span className="live liveOn" title="Ceny se stahují automaticky každý den"><i className="dot" />Ceny z OTE, staženo {kdy}</span>;
+    stav = <span className="live liveOn" title="Ceny se stahují automaticky každý den"><i className="dot" />Ceny z {zdroj}, staženo {kdy}</span>;
   }
   return (
     <header className="top">
@@ -673,7 +721,7 @@ function Appliances({ appliances, plan, editing, setEditing, toggle, patchApp, r
 }
 
 // ═══ Složení ceny ══════════════════════════════════════════════
-function PriceTab({ cfg, update, prices }) {
+function PriceTab({ cfg, update, prices, eurCzk }) {
   const now = prices[new Date().getHours()] ?? prices[0];
   const pct = (v) => Math.round((v / now.price) * 100);
   return (
@@ -681,7 +729,7 @@ function PriceTab({ cfg, update, prices }) {
       <div>
         <h3>Tvoje odběrné místo</h3>
         <Field label="Distributor">
-          <select value={cfg.distributor} onChange={(e) => update({ distributor: e.target.value, rate: "D25d" })}>
+          <select value={cfg.distributor} onChange={(e) => update({ distributor: e.target.value })}>
             {Object.entries(DISTRIBUTORS).map(([k, v]) => <option key={k} value={k}>{v.name}</option>)}
           </select>
         </Field>
@@ -691,10 +739,28 @@ function PriceTab({ cfg, update, prices }) {
               <option key={k} value={k}>{v.label}</option>)}
           </select>
         </Field>
-        <Field label="Kurz eura"><input type="number" step="0.01" value={cfg.eurCzk}
-          onChange={(e) => update({ eurCzk: +e.target.value })} /></Field>
-        <Field label="Marže dodavatele v Kč za kWh"><input type="number" step="0.01" value={cfg.margin}
-          onChange={(e) => update({ margin: +e.target.value })} /></Field>
+        <Field label="Dodavatel a jeho přirážka ke spotu">
+          <select value={cfg.dodavatel ?? "spot"} onChange={(e) => update({ dodavatel: e.target.value })}>
+            <option value="spot">Čistý spot, bez přirážky</option>
+            {DODAVATELE.map((d) => (
+              <option key={d.id} value={d.id}>{d.nazev}, {fmt(d.marze)} Kč za kWh</option>
+            ))}
+            <option value="vlastni">Zadám přirážku sám</option>
+          </select>
+        </Field>
+        {cfg.dodavatel === "vlastni" && (
+          <Field label="Přirážka dodavatele v Kč za kWh bez DPH, najdeš ji ve smlouvě">
+            <input type="number" step="0.01" min="0" value={cfg.margin}
+              onChange={(e) => update({ margin: Math.max(0, +e.target.value) })} />
+          </Field>
+        )}
+        {DODAVATELE.length === 0 && (
+          <p className="fieldNote">
+            Spotová cena je u všech dodavatelů stejná, liší se jen přirážka. Když ji znáš
+            ze smlouvy, vyber Zadám přirážku sám.
+          </p>
+        )}
+        {eurCzk && <p className="fieldNote">Kurz eura dnes {fmt(eurCzk, 3)} Kč podle ČNB, bere se automaticky.</p>}
         <Field label="Systémové poplatky v Kč za kWh"><input type="number" step="0.01" value={cfg.systemFees}
           onChange={(e) => update({ systemFees: +e.target.value })} /></Field>
         <Field label="Tvůj fixní tarif v Kč za kWh s DPH, nepovinné">
@@ -785,54 +851,181 @@ function NtEditor({ cfg, update }) {
   );
 }
 
-// ═══ Předplatné ════════════════════════════════════════════════
-function Premium({ bt, premium, setPremium }) {
-  const cena = 149;
-  const mesicne = bt.perMonth;
-  const vyplatiSe = mesicne > cena * 1.5;
+// ═══ Premium: obal kolem placených funkcí ══════════════════════
+/**
+ * V režimu "zdarma" ukáže funkci s označením, že je teď zdarma.
+ * V režimu "placene" místo ní ukáže zámek s odkazem na platbu.
+ */
+function PremiumBlok({ id, children }) {
+  const f = FUNKCE.find((x) => x.id === id);
+  if (jePremium()) {
+    return (
+      <div className="premWrap">
+        {jeZdarmaRezim() && <span className="premTag">Premium, teď zdarma</span>}
+        {children}
+      </div>
+    );
+  }
+  return (
+    <section className="sec lock">
+      <span className="premTag">Premium</span>
+      <h2 className="secHead">{f?.nazev}</h2>
+      <p className="secSub">{f?.popis}</p>
+      {PLATBA_URL
+        ? <a className="btn btnSolid" href={PLATBA_URL} target="_blank" rel="noopener">Odemknout za {PREMIUM_CENA} Kč měsíčně</a>
+        : <p className="secSub">Předplatné se připravuje.</p>}
+    </section>
+  );
+}
+
+// ═══ Kalendář k odběru (premium) ═══════════════════════════════
+function KalendarOdber({ profil }) {
+  const [vyber, setVyber] = useState(PROFILY[profil] ? profil : VYCHOZI_PROFIL);
+  const [kopie, setKopie] = useState(false);
+  useEffect(() => { if (PROFILY[profil]) setVyber(profil); }, [profil]);
+
+  const url = new URL(`data/kalendar/${vyber}.ics`, window.location.href).href;
+  const webcal = url.replace(/^https?:/, "webcal:");
+  const google = `https://calendar.google.com/calendar/render?cid=${encodeURIComponent(webcal)}`;
+  const kopiruj = async () => {
+    try { await navigator.clipboard.writeText(url); setKopie(true); setTimeout(() => setKopie(false), 2000); }
+    catch { window.prompt("Zkopíruj adresu kalendáře:", url); }
+  };
+
+  return (
+    <section className="sec">
+      <h2 className="secHead">Připomínky samy v telefonu</h2>
+      <p className="secSub">
+        Přidej si kalendář jednou a každý den se v něm sám objeví plán, kdy co zapnout,
+        s připomínkou pět minut předem. Když bude den výjimečně rozkolísaný, přijde i celodenní
+        upozornění. Stránku už pak otevírat nemusíš.
+      </p>
+
+      <div className="kalProf" role="radiogroup" aria-label="Kalendář pro domácnost">
+        {Object.entries(PROFILY).map(([k, p]) => (
+          <button key={k} role="radio" aria-checked={vyber === k}
+            className={vyber === k ? "kp kpOn" : "kp"} onClick={() => setVyber(k)}>{p.nazev}</button>
+        ))}
+      </div>
+
+      <div className="kalBtns">
+        <a className="btn btnSolid" href={google} target="_blank" rel="noopener">Přidat do Google kalendáře</a>
+        <a className="btn" href={webcal}>Přidat na iPhone nebo Mac</a>
+        <button className="btn" onClick={kopiruj}>{kopie ? "Zkopírováno" : "Zkopírovat adresu"}</button>
+      </div>
+
+      <p className="fieldNote">
+        Kalendář počítá s obecným tarifem D02d a spotřebiči zvolené domácnosti, ne s tvým
+        vlastním nastavením na této stránce. Google si odebírané kalendáře obnovuje sám,
+        obvykle jednou za několik hodin, takže zítřejší plán se objeví během odpoledne nebo večera.
+      </p>
+    </section>
+  );
+}
+
+// ═══ Historie a export (premium) ═══════════════════════════════
+function Historie({ bt, historie, cfgEff, todayPrices, tomorrowPrices }) {
+  const cenyDnu = useMemo(() => Object.fromEntries(historie.map((d) => {
+    const p = toFinalPrices(d.eur, { ...cfgEff, eurCzk: d.eurCzk });
+    return [d.date, p.reduce((a, x) => a + x.price, 0) / p.length];
+  })), [historie, cfgEff]);
+  const mesice = useMemo(() => mesicniPrehled(bt.days, cenyDnu), [bt.days, cenyDnu]);
+  const nazevMesice = (m) => new Intl.DateTimeFormat("cs-CZ", { month: "long", year: "numeric" })
+    .format(new Date(`${m}-15T12:00:00`));
+
+  const exportHodin = () => {
+    const dny = [{ date: isoDay(0), prices: todayPrices }];
+    if (tomorrowPrices) dny.push({ date: isoDay(1), prices: tomorrowPrices });
+    stahnoutSoubor(csvHodiny(dny.filter((d) => d.prices)), `ceny-${isoDay(0)}.csv`, "text/csv;charset=utf-8");
+  };
+  const exportDnu = () => stahnoutSoubor(csvDny(bt.days), `uspory-${isoDay(0)}.csv`, "text/csv;charset=utf-8");
+
+  if (bt.dayCount < 3) {
+    return (
+      <section className="sec">
+        <h2 className="secHead">Historie a měsíční přehled</h2>
+        <p className="secSub">Objeví se, až budou nasbírané aspoň tři dny skutečných cen.</p>
+      </section>
+    );
+  }
+
+  const body = bt.days.map((d) => cenyDnu[d.date]).filter(Number.isFinite);
+  const min = Math.min(...body), max = Math.max(...body);
+  const W = 600, H = 90;
+  const x = (i) => (i / Math.max(1, body.length - 1)) * W;
+  const y = (v) => H - 8 - ((v - min) / Math.max(0.01, max - min)) * (H - 16);
+  const cesta = body.map((v, i) => `${i ? "L" : "M"} ${x(i).toFixed(1)} ${y(v).toFixed(1)}`).join(" ");
+
+  return (
+    <section className="sec">
+      <h2 className="secHead">Historie a měsíční přehled</h2>
+      <p className="secSub">
+        Průměrná cena za kWh po dnech, od {czDate(bt.from)} do {czDate(bt.to)}.
+        Nejlevnější den {fmt(min)} Kč, nejdražší {fmt(max)} Kč.
+      </p>
+      <svg viewBox={`0 0 ${W} ${H}`} className="spark" role="img" aria-label="Vývoj průměrné ceny po dnech">
+        <path d={cesta} fill="none" stroke="var(--save)" strokeWidth="2.2" strokeLinejoin="round" />
+      </svg>
+
+      <div className="tblWrap">
+        <table className="tbl">
+          <thead><tr><th>Měsíc</th><th>Dní</th><th>Ušetřeno plánem</th><th>Průměrná cena</th></tr></thead>
+          <tbody>
+            {mesice.map((m) => (
+              <tr key={m.mesic}>
+                <td>{nazevMesice(m.mesic)}</td>
+                <td>{m.dnu}</td>
+                <td className="num">{fmtCzk(m.usetreno)}</td>
+                <td className="num">{fmt(m.prumerCen)} Kč</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="kalBtns">
+        <button className="btn" onClick={exportHodin}>Stáhnout ceny po hodinách</button>
+        <button className="btn" onClick={exportDnu}>Stáhnout denní přehled úspor</button>
+      </div>
+      <p className="fieldNote">Tabulka se otevře v Excelu nebo Google Tabulkách, oddělovač je středník.</p>
+    </section>
+  );
+}
+
+// ═══ Co všechno umí ════════════════════════════════════════════
+function Premium({ bt }) {
+  const zdarma = FUNKCE.filter((f) => !f.premium);
+  const prem = FUNKCE.filter((f) => f.premium);
   return (
     <div>
-      <h3>Co je zdarma a co ne</h3>
+      <h3>Co všechno stránka umí</h3>
       <div className="plans">
         <div className="plan">
           <p className="planName">Zdarma</p>
-          <ul>
-            <li>Ceny na dnešek a zítřek a plán, kdy co zapnout</li>
-            <li>Připomínky v kalendáři telefonu</li>
-            <li>Přepočet podle tvého distributora a tarifu</li>
-          </ul>
+          <ul>{zdarma.map((f) => <li key={f.id}><strong>{f.nazev}.</strong> {f.popis}.</li>)}</ul>
         </div>
-        <div className={premium ? "plan planOn" : "plan"}>
-          <p className="planName">Předplatné {cena} Kč měsíčně</p>
-          <ul>
-            <li>Automatické sepnutí spotřebičů přes chytré zásuvky</li>
-            <li>Upozornění do telefonu, když je dnešek výjimečně levný</li>
-            <li>Měsíční přehled podle tvé skutečné spotřeby</li>
-          </ul>
-          <button className="btn btnSolid" onClick={() => setPremium(!premium)}>
-            {premium ? "Zavřít" : "Chci vědět, až to spustíte"}
-          </button>
-          {premium && <p className="planNote">Předplatné zatím není v prodeji. Děkujeme za zájem.</p>}
+        <div className="plan planOn">
+          <p className="planName">
+            Premium {jeZdarmaRezim() ? "— teď zdarma pro všechny" : `za ${PREMIUM_CENA} Kč měsíčně`}
+          </p>
+          <ul>{prem.map((f) => <li key={f.id}><strong>{f.nazev}.</strong> {f.popis}.</li>)}</ul>
+          {!jeZdarmaRezim() && PLATBA_URL && (
+            <a className="btn btnSolid" href={PLATBA_URL} target="_blank" rel="noopener">Odemknout premium</a>
+          )}
         </div>
       </div>
       <div className="honest">
-        <p className="honestTitle">Vyplatí se ti to?</p>
-        {bt.dayCount >= 3 ? (
-          <>
-            <p>
-              Podle skutečných cen za {dni(bt.dayCount)} ušetří plánování tvé domácnosti zhruba
-              <strong> {fmtCzk(mesicne)} měsíčně</strong>.
-              {vyplatiSe
-                ? ` To je citelně víc než ${cena} Kč za předplatné.`
-                : ` To není o tolik víc než ${cena} Kč, takže předplatné se ti nemusí vyplatit.`}
-            </p>
-            <p>
-              Úsporu dostaneš i zdarma, když plán dodržíš. Předplatné platíš za to, že se
-              o to nemusíš starat.
-            </p>
-          </>
-        ) : (
-          <p>Až bude nasbíráno pár dní skutečných cen, spočítá se tu, jestli se ti předplatné vyplatí.</p>
+        <p className="honestTitle">Co stránka zatím neumí</p>
+        <p>
+          Sama spotřebiče nezapne. K tomu by byly potřeba chytré zásuvky a napojení na ně,
+          což je v plánu. Do té doby slouží připomínky v kalendáři.
+        </p>
+        {bt.dayCount >= 3 && (
+          <p>
+            Podle skutečných cen za {dni(bt.dayCount)} ušetří plánování tvé domácnosti zhruba
+            <strong> {fmtCzk(bt.perMonth)} měsíčně</strong>. Tu úsporu dostaneš zdarma, když plán
+            dodržíš; premium ti jen ušetří starost.
+          </p>
         )}
       </div>
     </div>
@@ -1149,4 +1342,29 @@ input:focus,select:focus{border-color:var(--save)}
 .secHead{font-size:clamp(20px,2.4vw,26px)}
 .planNote{font-size:12.5px;color:var(--save);margin-top:10px}
 .board{margin-top:18px}
+
+.premWrap{position:relative}
+.premTag{display:inline-block;font-size:11.5px;font-weight:700;letter-spacing:.01em;
+  color:#7A4E00;background:#FDF0CF;border:1px solid #F1D794;padding:3px 10px;border-radius:999px;
+  margin:22px clamp(16px,4vw,40px) -8px}
+.sec{margin:14px clamp(16px,4vw,40px) 0;background:var(--card);border-radius:22px;
+  padding:clamp(20px,3vw,28px);box-shadow:0 1px 2px rgba(20,30,50,.05)}
+.lock .premTag{margin:0 0 10px}
+.secSub{color:var(--dim);font-size:14.5px;line-height:1.55;margin-top:8px;max-width:66ch}
+.kalProf{display:flex;flex-wrap:wrap;gap:6px;margin-top:16px}
+.kp{border:1px solid var(--line);background:var(--card);border-radius:999px;padding:7px 14px;
+  font-size:13.5px;cursor:pointer;color:var(--ink)}
+.kpOn{background:var(--ink);color:#fff;border-color:var(--ink)}
+.kalBtns{display:flex;flex-wrap:wrap;gap:10px;margin-top:16px}
+.kalBtns .btn{text-decoration:none;display:inline-flex;align-items:center}
+.fieldNote{font-size:12.5px;color:var(--dim);line-height:1.55;margin:4px 0 12px;max-width:62ch}
+.sec .fieldNote{margin-top:14px}
+.spark{width:100%;height:90px;margin-top:14px;display:block}
+.tblWrap{overflow-x:auto;margin-top:14px}
+.tbl{width:100%;border-collapse:collapse;font-size:14px}
+.tbl th{text-align:left;font-weight:600;color:var(--dim);font-size:12.5px;padding:8px 10px;border-bottom:1px solid var(--line)}
+.tbl td{padding:10px;border-bottom:1px solid var(--line)}
+.tbl .num{font-variant-numeric:tabular-nums;text-align:right}
+.tbl th:nth-child(n+3){text-align:right}
+.footLink{color:var(--save);font-weight:600}
 `;

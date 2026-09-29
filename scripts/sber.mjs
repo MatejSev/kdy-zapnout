@@ -12,12 +12,21 @@
 import { readFile, writeFile, readdir, mkdir } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { prahaDatum, stahniOte, stahniKurz, stahniSlunce } from './zdroje.mjs';
+import { prahaDatum, stahniCeny, stahniKurz, stahniSlunce } from './zdroje.mjs';
+import { toFinalPrices, buildFeedIcs, backtest, PROFILY } from '../src/logika.js';
+import { SYSTEM_FEES } from '../src/tarify.js';
 
 const KOREN = join(dirname(fileURLToPath(import.meta.url)), '..');
 const DATA = process.env.DATA_DIR || join(KOREN, 'public', 'data');
 const CENY = join(DATA, 'prices');
 const HISTORIE_DNU = 120; // kolik dní historie dostane stránka
+
+// Stejné obecné výchozí jako na stránce: jednotarif D02d, bez marže, bez panelů.
+// Kalendáře k odběru jsou společné pro všechny, proto obecné nastavení.
+export const OBECNE_CFG = {
+  distributor: 'CEZ', rate: 'D02d', margin: 0, marginPct: 0,
+  systemFees: SYSTEM_FEES, kwp: 0, feedIn: 0, baseLoadPerHour: 0.3, ntHours: null,
+};
 
 const log = (...a) => console.log(...a);
 
@@ -28,7 +37,7 @@ async function nactiJson(cesta) {
 const uplny = (rec) => Array.isArray(rec?.hours) && rec.hours.length >= 23 && rec.hours.length <= 25 && rec.eurCzk;
 
 export async function sberDne(datum, zavislosti = {}) {
-  const { ote = stahniOte, kurz = stahniKurz, slunce = stahniSlunce } = zavislosti;
+  const { ceny: stahni = stahniCeny, kurz = stahniKurz, slunce = stahniSlunce } = zavislosti;
   const soubor = join(CENY, `${datum}.json`);
   const stary = await nactiJson(soubor);
   if (uplny(stary)) {
@@ -36,7 +45,7 @@ export async function sberDne(datum, zavislosti = {}) {
     return { datum, preskoceno: true };
   }
 
-  const [ceny, eurCzk, vykon] = await Promise.allSettled([ote(datum), kurz(), slunce(datum)]);
+  const [ceny, eurCzk, vykon] = await Promise.allSettled([stahni(datum), kurz(), slunce(datum)]);
   if (ceny.status !== 'fulfilled') throw new Error(`${datum}: ${ceny.reason.message}`);
   if (eurCzk.status !== 'fulfilled') throw new Error(`${datum}: ${eurCzk.reason.message}`);
 
@@ -47,13 +56,14 @@ export async function sberDne(datum, zavislosti = {}) {
     date: datum,
     collectedAt: new Date().toISOString(),
     eurCzk: Math.round(eurCzk.value * 1000) / 1000,
-    hours: ceny.value.map((h) => ({ hour: h.hour, eurMwh: h.eurMwh, radiation: pv[h.hour] ?? null })),
+    source: ceny.value.zdroj,
+    hours: ceny.value.hodiny.map((h) => ({ hour: h.hour, eurMwh: h.eurMwh, radiation: pv[h.hour] ?? null })),
   };
   if (!uplny(zaznam)) throw new Error(`${datum}: nečekaný počet hodin (${zaznam.hours.length})`);
 
   await mkdir(CENY, { recursive: true });
   await writeFile(soubor, JSON.stringify(zaznam, null, 1), 'utf8');
-  log(`  ${datum}: uloženo ${zaznam.hours.length} hodin, kurz ${zaznam.eurCzk}`);
+  log(`  ${datum}: uloženo ${zaznam.hours.length} hodin ze zdroje ${zaznam.source}, kurz ${zaznam.eurCzk}`);
   return zaznam;
 }
 
@@ -72,6 +82,7 @@ export async function sestavLatest() {
       eurCzk: rec.eurCzk,
       eur: s.map((h) => Math.round(h.eurMwh * 100) / 100),
       pv: s.map((h) => (h.radiation == null ? 0 : Math.round(h.radiation * 100) / 100)),
+      src: rec.source ?? 'OTE', // starší soubory zdroj neuváděly, byly vždy z OTE
     };
   }
   // Čas skutečně posledního stažení, ne čas běhu. Když sběr selže,
@@ -81,6 +92,29 @@ export async function sestavLatest() {
   await mkdir(DATA, { recursive: true });
   await writeFile(join(DATA, 'latest.json'), JSON.stringify(latest), 'utf8');
   return latest;
+}
+
+/** Kalendář k odběru pro každý typ domácnosti. */
+export async function sestavKalendare(latest, dnes, zitra) {
+  const dir = join(DATA, 'kalendar');
+  await mkdir(dir, { recursive: true });
+  const den = (datum) => {
+    const d = latest.days[datum];
+    return d ? { date: datum, prices: toFinalPrices(d.eur, { ...OBECNE_CFG, eurCzk: d.eurCzk }) } : null;
+  };
+  const dny = [den(dnes), den(zitra)].filter(Boolean);
+  const historie = Object.entries(latest.days)
+    .filter(([d]) => d < dnes)
+    .map(([date, v]) => ({ date, ...v }));
+  const vytvoreno = [];
+  for (const [id, profil] of Object.entries(PROFILY)) {
+    // rozptyl minulých dnů pro rozpoznání výjimečného dne
+    const spreads = backtest(historie, OBECNE_CFG, profil.appliances).days;
+    const ics = buildFeedIcs({ nazev: profil.nazev, dny, appliances: profil.appliances, historie: spreads, cfg: OBECNE_CFG });
+    await writeFile(join(dir, `${id}.ics`), ics, 'utf8');
+    vytvoreno.push(id);
+  }
+  return vytvoreno;
 }
 
 // ── spuštění z příkazové řádky ───────────────────────────────
@@ -98,6 +132,8 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
 
   const latest = await sestavLatest();
   log(`latest.json: ${Object.keys(latest.days).length} dní`);
+  const kal = await sestavKalendare(latest, dnes, zitra);
+  log(`kalendáře k odběru: ${kal.join(', ')}`);
 
   if (!dnesOk && !latest.days[dnes]) {
     console.error(`\nNepodařilo se získat ceny na dnešek (${dnes}). Stránka ukazuje starší data.`);

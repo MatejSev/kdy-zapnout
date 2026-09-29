@@ -11,12 +11,22 @@ import {
   toFinalPrices, optimize, backtest, actionFor, odpocet, cheapestWindow, oknoPopis,
   buildIcs, hoursLabel, dni, dayCharacter, tier, PROFILY, VYCHOZI_PROFIL,
 } from '../src/logika.js';
-import { naHodiny, prahaDatum, vyberDen } from '../scripts/zdroje.mjs';
+import { naHodiny, prahaDatum, vyberDen, zpracujEntsoe, prazskaPulnocUtc, dalsiDen, stahniCeny } from '../scripts/zdroje.mjs';
+import { buildFeedIcs, mesicniPrehled, csvHodiny, csvDny } from '../src/logika.js';
+import { PREMIUM_REZIM, PLATBA_URL, DODAVATELE } from '../src/nastaveni.js';
+import { FUNKCE, jePremium } from '../src/premium.js';
 
 let ok = 0, chyby = 0;
+const cekajici = [];
+const pass = (n) => { console.log(`  ✓ ${n}`); ok++; };
+const fail = (n, e) => { console.log(`  ✗ ${n}\n      ${e.message}`); chyby++; };
+// Podporuje i asynchronní testy: jinak by jejich selhání prošlo bez povšimnutí.
 const t = (nazev, fn) => {
-  try { fn(); console.log(`  ✓ ${nazev}`); ok++; }
-  catch (e) { console.log(`  ✗ ${nazev}\n      ${e.message}`); chyby++; }
+  try {
+    const r = fn();
+    if (r && typeof r.then === 'function') { cekajici.push(r.then(() => pass(nazev), (e) => fail(nazev, e))); return; }
+    pass(nazev);
+  } catch (e) { fail(nazev, e); }
 };
 const den = (arr) => arr;
 const cfg = { distributor: 'CEZ', rate: 'D02d', margin: 0, marginPct: 0, systemFees: SYSTEM_FEES,
@@ -154,5 +164,94 @@ t('výjimečný den se pozná jen s dost historií', () => {
   assert.strictEqual(dayCharacter([{ price: 1 }, { price: 10 }], h.slice(0, 3)).kind, 'unknown');
 });
 
+
+console.log('\nzáložní zdroj ENTSO-E:');
+const od = prazskaPulnocUtc('2026-09-25'), doC = prazskaPulnocUtc('2026-09-26');
+t('česká půlnoc v UTC v létě i v zimě', () => {
+  assert.strictEqual(new Date(od).toISOString(), '2026-09-24T22:00:00.000Z');
+  assert.strictEqual(new Date(prazskaPulnocUtc('2026-01-15')).toISOString(), '2026-01-14T23:00:00.000Z');
+});
+t('den změny času má 23 a 25 hodin', () => {
+  assert.strictEqual((prazskaPulnocUtc(dalsiDen('2026-03-29')) - prazskaPulnocUtc('2026-03-29')) / 36e5, 23);
+  assert.strictEqual((prazskaPulnocUtc(dalsiDen('2026-10-25')) - prazskaPulnocUtc('2026-10-25')) / 36e5, 25);
+});
+const entsoeXml = (() => {
+  let p = '';
+  for (let i = 1; i <= 96; i++) if (i % 4 === 1) p += `<Point><position>${i}</position><price.amount>${100 + Math.floor((i - 1) / 4)}</price.amount></Point>`;
+  return `<Publication_MarketDocument><TimeSeries><curveType>A03</curveType><Period><timeInterval><start>2026-09-24T22:00Z</start><end>2026-09-25T22:00Z</end></timeInterval><resolution>PT15M</resolution>${p}</Period></TimeSeries></Publication_MarketDocument>`;
+})();
+t('vynechané body doplní předchozí cenou (křivka A03)', () => {
+  const h = zpracujEntsoe(entsoeXml, od, doC);
+  assert.strictEqual(h.length, 24);
+  assert.ok(h.every((x, i) => x.eurMwh === 100 + i));
+});
+t('prázdná odpověď ENTSO-E je chyba, ne nuly', () =>
+  assert.throws(() => zpracujEntsoe('<Acknowledgement_MarketDocument><text>No matching data found</text></Acknowledgement_MarketDocument>', od, doC), /No matching/));
+t('když OTE jede, záloha se nevolá', async () => {
+  const r = await stahniCeny('2026-09-25', { token: 'x', ote: async () => [{ hour: 0, eurMwh: 1 }], entsoe: async () => { throw new Error('nevolat'); } });
+  assert.strictEqual(r.zdroj, 'OTE');
+});
+
+console.log('\nkalendář k odběru:');
+const dnyFeed = [
+  { date: '2026-09-25', prices: toFinalPrices(eur, cfg) },
+  { date: '2026-09-26', prices: toFinalPrices(eur.map((e) => e * 1.1), cfg) },
+];
+const feed = buildFeedIcs({ nazev: 'Dům s bojlerem', dny: dnyFeed, appliances: PROFILY.bojler.appliances, cfg });
+t('platný kalendář s řádky CRLF', () => {
+  assert.ok(feed.startsWith('BEGIN:VCALENDAR\r\n') && feed.trimEnd().endsWith('END:VCALENDAR'));
+  assert.ok(!/[^\r]\n/.test(feed), 'řádek bez CR');
+});
+t('žádný řádek nemá přes 75 bajtů', () => {
+  const enc = new TextEncoder();
+  for (const r of feed.split('\r\n')) assert.ok(enc.encode(r).length <= 75, `dlouhý řádek: ${r}`);
+});
+t('obsahuje oba dny a stálé identifikátory událostí', () => {
+  assert.ok(feed.includes('UID:bojler-20260925-0@kdy-zapnout'));
+  assert.ok(feed.includes('UID:bojler-20260926-0@kdy-zapnout'));
+});
+t('čárky v textu jsou ošetřené', () => assert.ok(/DESCRIPTION:[^\r]*\\,/.test(feed)));
+t('výjimečný den přidá celodenní upozornění', () => {
+  const klid = Array.from({ length: 20 }, () => ({ spread: 1.2 }));
+  const f = buildFeedIcs({ nazev: 'X', dny: dnyFeed.slice(0, 1), appliances: PROFILY.bojler.appliances, historie: klid, cfg });
+  assert.ok(f.includes('DTSTART;VALUE=DATE:20260925'));
+});
+t('bez historie žádné upozornění nevymýšlí', () => assert.ok(!feed.includes('VALUE=DATE')));
+
+console.log('\npřehledy a export:');
+t('měsíční přehled seskupí dny podle měsíců', () => {
+  const m = mesicniPrehled([
+    { date: '2026-08-30', savedVsAverage: 10 }, { date: '2026-08-31', savedVsAverage: 5 },
+    { date: '2026-09-01', savedVsAverage: 7 }], { '2026-08-30': 4, '2026-08-31': 6, '2026-09-01': 5 });
+  assert.strictEqual(m.length, 2);
+  assert.strictEqual(m[0].usetreno, 15); assert.strictEqual(m[0].prumerCen, 5);
+});
+t('CSV pro český Excel: BOM, středník, desetinná čárka', () => {
+  const c = csvHodiny([{ date: '2026-09-25', prices: toFinalPrices([100], cfg) }]);
+  assert.ok(c.startsWith('\uFEFF'));
+  assert.ok(c.includes(';') && /5,92/.test(c));
+});
+t('CSV úspor má hlavičku a řádek za každý den', () =>
+  assert.strictEqual(csvDny(backtest(historie, cfg, apps).days).split('\r\n').length, 21));
+
+console.log('\npremium a nastavení:');
+t('režim premium je platná hodnota', () => assert.ok(['zdarma', 'placene'].includes(PREMIUM_REZIM)));
+t('placený režim nesmí jít ven bez odkazu na platbu', () => {
+  if (PREMIUM_REZIM === 'placene') assert.ok(PLATBA_URL.startsWith('https://'), 'chybí PLATBA_URL, funkce by nešly odemknout');
+});
+t('v režimu zdarma je premium odemčené', () => { if (PREMIUM_REZIM === 'zdarma') assert.strictEqual(jePremium(), true); });
+t('seznam funkcí má bezplatné i premium', () => {
+  assert.ok(FUNKCE.some((f) => f.premium) && FUNKCE.some((f) => !f.premium));
+  assert.strictEqual(new Set(FUNKCE.map((f) => f.id)).size, FUNKCE.length);
+});
+t('dodavatelé mají platnou přirážku a zdroj', () => {
+  for (const d of DODAVATELE) {
+    assert.ok(d.id && d.nazev, 'chybí id nebo název');
+    assert.ok(Number.isFinite(d.marze) && d.marze >= 0 && d.marze < 5, `${d.nazev}: podezřelá přirážka ${d.marze}`);
+    assert.ok(d.zdroj, `${d.nazev}: chybí zdroj, odkud je cena`);
+  }
+});
+
+await Promise.all(cekajici);
 console.log(`\n${ok} testů prošlo${chyby ? `, ${chyby} SELHALO` : ''}\n`);
 if (chyby) process.exit(1);

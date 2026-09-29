@@ -283,3 +283,140 @@ export const PROFILY = {
   tc: { nazev: "Tepelné čerpadlo", popis: "čerpadlo, pračka, myčka", appliances: [S.tc, S.pracka, S.mycka] },
 };
 export const VYCHOZI_PROFIL = "bojler";
+
+// ═══ Kalendář k odběru (premium) ═══════════════════════════════
+// Soubor, který si uživatel jednou přidá do kalendáře v telefonu.
+// GitHub ho každý den přegeneruje a kalendář si ho sám stáhne.
+
+const icsEsc = (s) => String(s).replace(/\\/g, "\\\\").replace(/;/g, "\\;").replace(/,/g, "\\,").replace(/\n/g, "\\n");
+
+/** Řádky ICS nesmí mít víc než 75 bajtů, delší se zalamují. */
+function icsFold(radek) {
+  const enc = new TextEncoder();
+  if (enc.encode(radek).length <= 75) return radek;
+  const out = [];
+  let kus = "", limit = 75;
+  for (const ch of radek) {
+    if (enc.encode(kus + ch).length > limit) { out.push(kus); kus = ""; limit = 74; }
+    kus += ch;
+  }
+  if (kus) out.push(kus);
+  return out.join("\r\n ");
+}
+
+function bloky(hodiny) {
+  if (!hodiny?.length) return [];
+  const out = [];
+  let a = hodiny[0], p = hodiny[0];
+  for (let i = 1; i <= hodiny.length; i++) {
+    if (hodiny[i] === p + 1) { p = hodiny[i]; continue; }
+    out.push([a, p + 1]);
+    a = hodiny[i]; p = hodiny[i];
+  }
+  return out;
+}
+
+/**
+ * @param {object} o
+ * @param {string} o.nazev          název kalendáře
+ * @param {Array<{date, prices}>} o.dny   dny k zahrnutí (dnes, zítra)
+ * @param {Array} o.appliances
+ * @param {Array<{spread}>} o.historie    pro rozpoznání výjimečného dne
+ * @param {object} o.cfg
+ */
+export function buildFeedIcs({ nazev, dny, appliances, historie = [], cfg, ted = new Date() }) {
+  const stamp = ted.toISOString().replace(/[-:]/g, "").slice(0, 15) + "Z";
+  const radky = [
+    "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Kdy zapnout//CS", "CALSCALE:GREGORIAN", "METHOD:PUBLISH",
+    `X-WR-CALNAME:${icsEsc(`Kdy zapnout: ${nazev}`)}`,
+    "X-WR-TIMEZONE:Europe/Prague",
+    "X-WR-CALDESC:Kdy zapnout spotřebiče podle spotové ceny elektřiny. Aktualizuje se samo.",
+    "REFRESH-INTERVAL;VALUE=DURATION:PT6H", "X-PUBLISHED-TTL:PT6H",
+  ];
+
+  for (const { date, prices } of dny) {
+    if (!prices?.length) continue;
+    const d = date.replaceAll("-", "");
+    const res = optimize({
+      prices, pv: new Array(prices.length).fill(0),
+      baseLoad: new Array(prices.length).fill(cfg.baseLoadPerHour ?? 0.3),
+      feedIn: cfg.feedIn ?? 0, appliances,
+    });
+    const t = (h) => `${d}T${String(Math.min(h, 23)).padStart(2, "0")}${h >= 24 ? "5900" : "0000"}`;
+
+    for (const p of res.plan) {
+      if (p.infeasible) continue;
+      bloky(p.hours).forEach(([a, b], i) => {
+        const cena = prices.slice(a, b).reduce((s, x) => s + x.price, 0) / (b - a);
+        radky.push(
+          "BEGIN:VEVENT",
+          // stálé UID: kalendář při aktualizaci událost přepíše, nezdvojí
+          `UID:${p.id}-${d}-${i}@kdy-zapnout`,
+          `DTSTAMP:${stamp}`,
+          `DTSTART:${t(a)}`,
+          `DTEND:${t(b)}`,
+          `SUMMARY:${icsEsc(`Zapnout: ${p.name}`)}`,
+          `DESCRIPTION:${icsEsc(`Levné hodiny, průměrně ${cena.toFixed(2).replace(".", ",")} Kč za kWh.`)}`,
+          "TRANSP:TRANSPARENT",
+          "BEGIN:VALARM", "TRIGGER:-PT5M", "ACTION:DISPLAY",
+          `DESCRIPTION:${icsEsc(`Zapnout: ${p.name}`)}`, "END:VALARM",
+          "END:VEVENT",
+        );
+      });
+    }
+
+    const charakter = dayCharacter(prices, historie);
+    if (charakter.kind === "big") {
+      radky.push(
+        "BEGIN:VEVENT",
+        `UID:vyjimka-${d}@kdy-zapnout`,
+        `DTSTAMP:${stamp}`,
+        `DTSTART;VALUE=DATE:${d}`,
+        `SUMMARY:${icsEsc(`Výjimečně rozkolísaná cena elektřiny, rozdíl ${charakter.today.toFixed(1).replace(".", ",")}×`)}`,
+        `DESCRIPTION:${icsEsc(`Obvykle bývá rozdíl ${charakter.median.toFixed(1).replace(".", ",")}×. Dnes se vyplatí plán dodržet víc než jindy.`)}`,
+        "TRANSP:TRANSPARENT",
+        "END:VEVENT",
+      );
+    }
+  }
+  radky.push("END:VCALENDAR");
+  return radky.map(icsFold).join("\r\n") + "\r\n";
+}
+
+// ═══ Historie a měsíční přehled (premium) ══════════════════════
+/** Seskupí dny z backtestu po měsících. */
+export function mesicniPrehled(btDny, cenyDnu) {
+  const mesice = new Map();
+  for (const d of btDny) {
+    const m = d.date.slice(0, 7);
+    if (!mesice.has(m)) mesice.set(m, { mesic: m, dnu: 0, usetreno: 0, prumerCen: 0, _soucet: 0 });
+    const x = mesice.get(m);
+    x.dnu++;
+    x.usetreno += d.savedVsAverage;
+    const cena = cenyDnu?.[d.date];
+    if (Number.isFinite(cena)) { x._soucet += cena; x.prumerCen = x._soucet / x.dnu; }
+  }
+  return [...mesice.values()].map(({ _soucet, ...x }) => x).sort((a, b) => a.mesic.localeCompare(b.mesic));
+}
+
+// ═══ Export (premium) ══════════════════════════════════════════
+const csvEsc = (v) => {
+  const s = String(v ?? "");
+  return /[";\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
+const cz = (n, d = 4) => (Number.isFinite(n) ? n.toFixed(d).replace(".", ",") : "");
+
+/** CSV se středníkem a desetinnou čárkou, aby ho český Excel otevřel správně. */
+export function csvHodiny(dny) {
+  const radky = [["datum", "hodina", "spot EUR/MWh", "cena Kč/kWh vč. DPH", "tarif"]];
+  for (const { date, prices } of dny) {
+    for (const p of prices) radky.push([date, `${String(p.hour).padStart(2, "0")}:00`, cz(p.eurMwh, 2), cz(p.price), p.tariff]);
+  }
+  return "\uFEFF" + radky.map((r) => r.map(csvEsc).join(";")).join("\r\n");
+}
+
+export function csvDny(btDny) {
+  const radky = [["datum", "kWh", "podle plánu Kč", "kdykoli Kč", "ušetřeno Kč", "rozdíl cen ×"]];
+  for (const d of btDny) radky.push([d.date, cz(d.kwh, 1), cz(d.optimized, 2), cz(d.atAverage, 2), cz(d.savedVsAverage, 2), cz(d.spread, 2)]);
+  return "\uFEFF" + radky.map((r) => r.map(csvEsc).join(";")).join("\r\n");
+}
