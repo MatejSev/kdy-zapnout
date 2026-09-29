@@ -53,6 +53,9 @@ jobs:
       - name: Sběr cen z OTE
         id: sber
         continue-on-error: true
+        env:
+          # nepovinné: záložní zdroj ENTSO-E, když OTE selže (viz NAVOD.md)
+          ENTSOE_TOKEN: ${{ secrets.ENTSOE_TOKEN }}
         run: npm run sber
 
       - name: Uložení nasbíraných dat
