@@ -28,59 +28,126 @@ export function toFinalPrices(eurArr, cfg) {
   });
 }
 
-export function optimize({ prices, pv, baseLoad, feedIn, appliances }) {
+/**
+ * Naplánuje spotřebiče do nejlevnějších hodin s ohledem na omezení:
+ *
+ *  - časové okno spotřebiče (ne dřív než, hotovo do)
+ *  - nepřerušitelný cyklus (pračka, myčka)
+ *  - spotřebiče, které nesmí běžet současně (conflicts)
+ *  - limit souběžného příkonu celého domu (maxKw), aby nepadaly pojistky
+ *
+ * Plánuje se postupně podle priority: kdo má nižší číslo, vybírá první.
+ * Je to rychlá a vysvětlitelná heuristika, ne matematicky dokonalé
+ * řešení — u pár spotřebičů za den je rozdíl zanedbatelný.
+ *
+ * U každého spotřebiče si pamatuje, jestli a proč se musel posunout
+ * z ideálních hodin, aby to šlo uživateli říct.
+ */
+export function optimize({ prices, pv, baseLoad, feedIn, appliances, maxKw = null }) {
   const price = prices.map((p) => p.price);
   const H = price.length;
-  const surplus = Array.from({ length: H }, (_, h) => Math.max(0, (pv[h] ?? 0) - (baseLoad[h] ?? 0)));
+  const zaklad = Array.from({ length: H }, (_, h) => baseLoad[h] ?? 0);
+  const surplus = Array.from({ length: H }, (_, h) => Math.max(0, (pv[h] ?? 0) - zaklad[h]));
   const remaining = [...surplus];
   const avg = price.reduce((a, b) => a + b, 0) / H;
-  const queue = appliances.filter((a) => a.enabled).sort((a, b) => a.priority - b.priority);
+  const limit = Number.isFinite(maxKw) && maxKw > 0 ? maxKw : Infinity;
+
+  const zapnute = appliances.filter((a) => a.enabled);
+  const podleId = new Map(zapnute.map((a) => [a.id, a]));
+  const fronta = [...zapnute].sort((a, b) => (a.priority ?? 50) - (b.priority ?? 50));
+  const zatizeni = [...zaklad];                               // kW v každé hodině
+  const bezi = Array.from({ length: H }, () => new Set());    // kdo v hodině běží
+  const vKonfliktu = (a, b) => (a.conflicts ?? []).includes(b.id) || (b.conflicts ?? []).includes(a.id);
   const plan = [];
 
-  for (const app of queue) {
-    const perHour = app.kwh / app.hours;
-    const from = app.earliest ?? 0;
-    const to = app.latest ?? H;
-    if (to - from < app.hours) {
-      plan.push({ ...app, infeasible: true, hours: [], cost: 0, pvUsed: 0, savingVsAvg: 0 });
-      continue;
-    }
-    let chosen;
-    if (app.contiguous) {
-      let best = null;
-      for (let s = from; s + app.hours <= to; s++) {
-        const tmp = [...remaining];
-        let cost = 0;
-        for (let k = 0; k < app.hours; k++) {
-          const h = s + k;
-          const fromPv = Math.min(tmp[h], perHour);
-          cost += fromPv * feedIn + (perHour - fromPv) * price[h];
-          tmp[h] -= fromPv;
+  for (const app of fronta) {
+    const naHodinu = app.kwh / app.hours;
+    // příkon nemůže být menší než energie za hodinu, to by fyzicky nešlo
+    const kw = Math.max(naHodinu, Number.isFinite(app.kw) && app.kw > 0 ? app.kw : naHodinu);
+    // omezení na délku dne: ve dnech změny času má den 23 nebo 25 hodin
+    const from = Math.max(0, Math.min(H, app.earliest ?? 0));
+    const to = Math.max(0, Math.min(H, app.latest ?? H));
+    const nelze = (duvod, extra = {}) => plan.push({ ...app, kw, infeasible: true, duvod, ...extra,
+      hours: [], cost: 0, pvUsed: 0, savingVsAvg: 0 });
+
+    if (to - from < app.hours) { nelze("okno"); continue; }
+    if (kw + Math.min(...zaklad) > limit + 1e-9) { nelze("prikon", { limit }); continue; }
+
+    // proč hodina nejde použít (null = jde)
+    const prekazka = (h) => {
+      for (const id of bezi[h]) {
+        const o = podleId.get(id);
+        if (o && vKonfliktu(app, o)) return { soubeh: o.name };
+      }
+      if (zatizeni[h] + kw > limit + 1e-9) return { limit: true };
+      return null;
+    };
+    const cenaHodiny = (h, pvZbyva) => {
+      const zPv = Math.min(pvZbyva[h], naHodinu);
+      return zPv * feedIn + (naHodinu - zPv) * price[h];
+    };
+
+    const vyber = (sOmezenim) => {
+      if (app.contiguous) {
+        let best = null;
+        for (let s = from; s + app.hours <= to; s++) {
+          const hodiny = Array.from({ length: app.hours }, (_, i) => s + i);
+          if (sOmezenim && hodiny.some((h) => prekazka(h))) continue;
+          const tmp = [...remaining];
+          let cost = 0;
+          for (const h of hodiny) { cost += cenaHodiny(h, tmp); tmp[h] -= Math.min(tmp[h], naHodinu); }
+          if (!best || cost < best.cost - 1e-12) best = { cost, hours: hodiny };
         }
-        if (!best || cost < best.cost) best = { cost, hours: Array.from({ length: app.hours }, (_, i) => s + i) };
+        return best;
       }
-      chosen = best;
-    } else {
-      const cand = [];
+      const kand = [];
       for (let h = from; h < to; h++) {
-        const fromPv = Math.min(remaining[h], perHour);
-        cand.push({ h, c: fromPv * feedIn + (perHour - fromPv) * price[h] });
+        if (sOmezenim && prekazka(h)) continue;
+        kand.push({ h, c: cenaHodiny(h, remaining) });
       }
-      cand.sort((a, b) => a.c - b.c || a.h - b.h);
-      const picked = cand.slice(0, app.hours);
-      chosen = { cost: picked.reduce((s, p) => s + p.c, 0), hours: picked.map((p) => p.h).sort((a, b) => a - b) };
-    }
+      if (kand.length < app.hours) return null;
+      kand.sort((a, b) => a.c - b.c || a.h - b.h);
+      const vybrane = kand.slice(0, app.hours);
+      return { cost: vybrane.reduce((s, x) => s + x.c, 0), hours: vybrane.map((x) => x.h).sort((a, b) => a - b) };
+    };
+
+    const idealni = vyber(false);
+    const chosen = vyber(true);
+
+    // co brání ideálnímu plánu
+    const duvody = () => {
+      const soubeh = new Set();
+      let lim = false;
+      for (const h of idealni?.hours ?? []) {
+        const pr = prekazka(h);
+        if (pr?.soubeh) soubeh.add(pr.soubeh);
+        if (pr?.limit) lim = true;
+      }
+      return { soubeh: [...soubeh], limit: lim };
+    };
+
+    if (!chosen) { nelze("omezeni", { omezeni: duvody() }); continue; }
+
+    const posunuto = chosen.cost > (idealni?.cost ?? chosen.cost) + 0.005 ? duvody() : null;
+
     let pvUsed = 0;
+    const pvPoHodinach = {};
     for (const h of chosen.hours) {
-      const fromPv = Math.min(remaining[h], perHour);
-      remaining[h] -= fromPv;
-      pvUsed += fromPv;
+      const zPv = Math.min(remaining[h], naHodinu);
+      remaining[h] -= zPv;
+      pvUsed += zPv;
+      pvPoHodinach[h] = zPv;
+      zatizeni[h] += kw;
+      bezi[h].add(app.id);
     }
-    plan.push({ ...app, hours: chosen.hours, cost: chosen.cost, pvUsed,
-      savingVsAvg: Math.max(0, avg * app.kwh - chosen.cost) });
+    plan.push({ ...app, kw, naHodinu, hours: chosen.hours, cost: chosen.cost, pvUsed, pvPoHodinach,
+      savingVsAvg: Math.max(0, avg * app.kwh - chosen.cost),
+      posunuto, priplatek: posunuto ? chosen.cost - idealni.cost : 0 });
   }
+
   return { plan, avg, minH: price.indexOf(Math.min(...price)), maxH: price.indexOf(Math.max(...price)),
-    surplus, unusedPv: remaining.reduce((a, b) => a + b, 0) };
+    surplus, unusedPv: remaining.reduce((a, b) => a + b, 0),
+    zatizeni, spicka: Math.max(...zatizeni), limit: Number.isFinite(limit) ? limit : null };
 }
 
 
@@ -233,7 +300,7 @@ export function backtest(days, cfg, appliances) {
     const pv = (d.pv ?? []).map((v) => (v ?? 0) * (cfg.kwp ?? 0));
     const res = optimize({
       prices, pv, baseLoad: new Array(prices.length).fill(cfg.baseLoadPerHour ?? 0.3),
-      feedIn: cfg.feedIn ?? 0, appliances,
+      feedIn: cfg.feedIn ?? 0, appliances, maxKw: cfg.maxKw ?? null,
     });
     const active = res.plan.filter((p) => !p.infeasible);
     const optimized = active.reduce((s, p) => s + p.cost, 0);
@@ -266,22 +333,68 @@ export function backtest(days, cfg, appliances) {
 }
 
 // ═══ Předvolby domácností ══════════════════════════════════════
-// Spotřeba je typický odhad, ne údaj dodavatele — ten nic takového
-// neposkytuje, liší se podle konkrétního spotřebiče. V UI se dá upravit.
-const S = {
-  pracka: { id: "pracka", name: "Pračka", kwh: 1.2, hours: 2, contiguous: true, earliest: 6, latest: 22, priority: 30, enabled: true },
-  mycka: { id: "mycka", name: "Myčka", kwh: 1.0, hours: 2, contiguous: true, earliest: 0, latest: 24, priority: 40, enabled: true },
-  bojler: { id: "bojler", name: "Bojler", kwh: 6, hours: 3, contiguous: false, earliest: 0, latest: 24, priority: 10, enabled: true },
-  auto: { id: "auto", name: "Nabíjení auta", kwh: 11, hours: 4, contiguous: false, earliest: 0, latest: 24, priority: 20, enabled: true },
-  tc: { id: "tc", name: "Tepelné čerpadlo", kwh: 9, hours: 6, contiguous: false, earliest: 0, latest: 24, priority: 5, enabled: true },
+// Spotřeba a příkon jsou typické odhady, ne údaj dodavatele — ten nic
+// takového neposkytuje, liší se podle konkrétního spotřebiče. Příkon
+// (kw) je to, co spotřebič odebírá, když topí nebo nabíjí; podle něj
+// se hlídá limit, aby nepadaly pojistky. V UI se dá všechno upravit.
+export const SABLONY = {
+  bojler: { name: "Bojler", kwh: 6, hours: 3, kw: 2.0, contiguous: false, earliest: 0, latest: 24, priority: 10 },
+  auto: { name: "Nabíjení auta", kwh: 11, hours: 3, kw: 3.7, contiguous: false, earliest: 0, latest: 24, priority: 20 },
+  pracka: { name: "Pračka", kwh: 1.2, hours: 2, kw: 2.0, contiguous: true, earliest: 6, latest: 22, priority: 30 },
+  mycka: { name: "Myčka", kwh: 1.0, hours: 2, kw: 2.0, contiguous: true, earliest: 0, latest: 24, priority: 40 },
+  susicka: { name: "Sušička prádla", kwh: 2.5, hours: 2, kw: 2.5, contiguous: true, earliest: 6, latest: 22, priority: 35 },
+  tc: { name: "Tepelné čerpadlo", kwh: 9, hours: 6, kw: 2.5, contiguous: false, earliest: 0, latest: 24, priority: 5 },
+  bazen: { name: "Filtrace bazénu", kwh: 3, hours: 4, kw: 0.8, contiguous: false, earliest: 0, latest: 24, priority: 60 },
+  vlastni: { name: "Nový spotřebič", kwh: 2, hours: 2, kw: 2.0, contiguous: false, earliest: 0, latest: 24, priority: 50 },
 };
 
+const ze = (id) => ({ id, ...SABLONY[id], conflicts: [], enabled: true });
+
 export const PROFILY = {
-  byt: { nazev: "Byt", popis: "pračka a myčka", appliances: [S.pracka, S.mycka] },
-  bojler: { nazev: "Dům s bojlerem", popis: "bojler, pračka, myčka", appliances: [S.bojler, S.pracka, S.mycka] },
-  auto: { nazev: "S elektromobilem", popis: "auto, bojler, pračka", appliances: [S.auto, S.bojler, S.pracka] },
-  tc: { nazev: "Tepelné čerpadlo", popis: "čerpadlo, pračka, myčka", appliances: [S.tc, S.pracka, S.mycka] },
+  byt: { nazev: "Byt", popis: "pračka a myčka", appliances: [ze("pracka"), ze("mycka")] },
+  bojler: { nazev: "Dům s bojlerem", popis: "bojler, pračka, myčka", appliances: [ze("bojler"), ze("pracka"), ze("mycka")] },
+  auto: { nazev: "S elektromobilem", popis: "auto, bojler, pračka", appliances: [ze("auto"), ze("bojler"), ze("pracka")] },
+  tc: { nazev: "Tepelné čerpadlo", popis: "čerpadlo, pračka, myčka", appliances: [ze("tc"), ze("pracka"), ze("mycka")] },
 };
+
+/** Nový spotřebič ze šablony, s jedinečným id. */
+export function novySpotrebic(sablona, existujici = []) {
+  const zaklad = SABLONY[sablona] ?? SABLONY.vlastni;
+  let id = sablona, i = 2;
+  while (existujici.some((a) => a.id === id)) id = `${sablona}${i++}`;
+  return { id, ...zaklad, conflicts: [], enabled: true };
+}
+
+/**
+ * Doplní příkon a seznam konfliktů u spotřebičů uložených ve starší
+ * verzi stránky, aby limit příkonu nepočítal s nesmyslnou hodnotou.
+ */
+export function doplnSpotrebice(seznam) {
+  const zakladniId = (id) => Object.keys(SABLONY).find((k) => id === k || id.startsWith(k));
+  return seznam.map((a) => ({
+    ...a,
+    kw: Number.isFinite(a.kw) && a.kw > 0 ? a.kw : (SABLONY[zakladniId(a.id)]?.kw ?? a.kwh / a.hours),
+    conflicts: Array.isArray(a.conflicts) ? a.conflicts.filter((c) => seznam.some((x) => x.id === c)) : [],
+  }));
+}
+
+/** Nastaví nebo zruší zákaz souběhu, vždy na obou stranách. */
+export function prepniKonflikt(seznam, idA, idB) {
+  const maji = seznam.find((a) => a.id === idA)?.conflicts?.includes(idB)
+    || seznam.find((a) => a.id === idB)?.conflicts?.includes(idA);
+  return seznam.map((a) => {
+    const c = new Set(a.conflicts ?? []);
+    if (a.id === idA) maji ? c.delete(idB) : c.add(idB);
+    if (a.id === idB) maji ? c.delete(idA) : c.add(idA);
+    return { ...a, conflicts: [...c] };
+  });
+}
+
+/** Odebere spotřebič a vyčistí po něm odkazy v konfliktech ostatních. */
+export function odeberSpotrebic(seznam, id) {
+  return seznam.filter((a) => a.id !== id).map((a) => ({ ...a, conflicts: (a.conflicts ?? []).filter((c) => c !== id) }));
+}
+
 export const VYCHOZI_PROFIL = "bojler";
 
 // ═══ Kalendář k odběru (premium) ═══════════════════════════════

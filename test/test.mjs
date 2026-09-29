@@ -12,7 +12,7 @@ import {
   buildIcs, hoursLabel, dni, dayCharacter, tier, PROFILY, VYCHOZI_PROFIL,
 } from '../src/logika.js';
 import { naHodiny, prahaDatum, vyberDen, zpracujEntsoe, prazskaPulnocUtc, dalsiDen, stahniCeny } from '../scripts/zdroje.mjs';
-import { buildFeedIcs, mesicniPrehled, csvHodiny, csvDny } from '../src/logika.js';
+import { buildFeedIcs, mesicniPrehled, csvHodiny, csvDny, SABLONY, novySpotrebic, doplnSpotrebice, prepniKonflikt, odeberSpotrebic } from '../src/logika.js';
 import { PREMIUM_REZIM, PLATBA_URL, DODAVATELE } from '../src/nastaveni.js';
 import { FUNKCE, jePremium } from '../src/premium.js';
 
@@ -250,6 +250,114 @@ t('dodavatelé mají platnou přirážku a zdroj', () => {
     assert.ok(Number.isFinite(d.marze) && d.marze >= 0 && d.marze < 5, `${d.nazev}: podezřelá přirážka ${d.marze}`);
     assert.ok(d.zdroj, `${d.nazev}: chybí zdroj, odkud je cena`);
   }
+});
+
+console.log('\nsouběh a limit příkonu:');
+const pr = { ...SABLONY.pracka, id: 'pracka', conflicts: ['mycka'], enabled: true, earliest: 0, latest: 24 };
+const my = { ...SABLONY.mycka, id: 'mycka', conflicts: ['pracka'], enabled: true };
+const prekryv = (a, b) => a.hours.some((h) => b.hours.includes(h));
+t('bez zákazu pračka a myčka klidně poběží naráz (stejné levné hodiny)', () => {
+  const r = optimize({ prices: ceny, pv: nula, baseLoad: nula, feedIn: 0,
+    appliances: [{ ...pr, conflicts: [] }, { ...my, conflicts: [] }] });
+  assert.ok(prekryv(r.plan[0], r.plan[1]));
+});
+t('se zákazem souběhu se nepřekryjí', () => {
+  const r = optimize({ prices: ceny, pv: nula, baseLoad: nula, feedIn: 0, appliances: [pr, my] });
+  assert.ok(!prekryv(r.plan[0], r.plan[1]), `${r.plan[0].hours} × ${r.plan[1].hours}`);
+});
+t('zákaz platí, i když ho má zapsaný jen jeden z nich', () => {
+  const r = optimize({ prices: ceny, pv: nula, baseLoad: nula, feedIn: 0, appliances: [pr, { ...my, conflicts: [] }] });
+  assert.ok(!prekryv(r.plan[0], r.plan[1]));
+});
+t('posunutý spotřebič ví proč a kolik to stojí navíc', () => {
+  const r = optimize({ prices: ceny, pv: nula, baseLoad: nula, feedIn: 0, appliances: [pr, my] });
+  const pos = r.plan.find((p) => p.posunuto);
+  assert.ok(pos, 'nikdo nebyl posunut');
+  assert.ok(pos.posunuto.soubeh.length === 1 && pos.priplatek > 0);
+});
+t('limit příkonu: dva spotřebiče po 2 kW se při limitu 3,5 kW nepotkají', () => {
+  const r = optimize({ prices: ceny, pv: nula, baseLoad: new Array(24).fill(0.3), feedIn: 0, maxKw: 3.5,
+    appliances: [{ ...pr, conflicts: [] }, { ...my, conflicts: [] }] });
+  assert.ok(!prekryv(r.plan[0], r.plan[1]));
+  assert.ok(r.spicka <= 3.5 + 1e-9, `špička ${r.spicka}`);
+});
+t('posun kvůli limitu se označí jako limit', () => {
+  const r = optimize({ prices: ceny, pv: nula, baseLoad: nula, feedIn: 0, maxKw: 3,
+    appliances: [{ ...pr, conflicts: [] }, { ...my, conflicts: [] }] });
+  assert.ok(r.plan.some((p) => p.posunuto?.limit));
+});
+t('spotřebič silnější než limit je nesplnitelný s důvodem', () => {
+  const r = optimize({ prices: ceny, pv: nula, baseLoad: nula, feedIn: 0, maxKw: 3,
+    appliances: [{ ...SABLONY.auto, id: 'auto', conflicts: [], enabled: true }] });
+  assert.strictEqual(r.plan[0].infeasible, true); assert.strictEqual(r.plan[0].duvod, 'prikon');
+});
+t('když se kvůli souběhu nevejde do okna, řekne to', () => {
+  const r = optimize({ prices: ceny, pv: nula, baseLoad: nula, feedIn: 0, appliances: [
+    { ...pr, earliest: 10, latest: 12, priority: 1 }, { ...my, earliest: 10, latest: 12, priority: 2 }] });
+  const x = r.plan.find((p) => p.infeasible);
+  assert.ok(x && x.duvod === 'omezeni' && x.omezeni.soubeh.length === 1);
+});
+t('bez omezení se plán nezměnil proti dřívějšku', () => {
+  const r = optimize({ prices: ceny, pv: nula, baseLoad: nula, feedIn: 0,
+    appliances: [{ id: 'b', name: 'B', kwh: 6, hours: 3, contiguous: false, priority: 1, enabled: true }] });
+  assert.deepStrictEqual(r.plan[0].hours, [12, 13, 14]);
+  assert.strictEqual(r.plan[0].posunuto, null);
+});
+t('den se 23 hodinami (změna času) nedá NaN', () => {
+  const c23 = toFinalPrices(eur.slice(0, 23), cfg);
+  const r = optimize({ prices: c23, pv: nula, baseLoad: nula, feedIn: 0,
+    appliances: [{ ...SABLONY.bojler, id: 'b', enabled: true, latest: 24 }] });
+  assert.ok(Number.isFinite(r.plan[0].cost) && r.plan[0].hours.every((h) => h < 23));
+});
+t('příkon menší než spotřeba za hodinu se opraví', () => {
+  const r = optimize({ prices: ceny, pv: nula, baseLoad: nula, feedIn: 0,
+    appliances: [{ id: 'x', name: 'X', kwh: 6, hours: 2, kw: 1, contiguous: false, priority: 1, enabled: true }] });
+  assert.strictEqual(r.plan[0].kw, 3);
+});
+t('úspora s limitem není větší než bez něj', () => {
+  const a = [{ ...pr, conflicts: [] }, { ...my, conflicts: [] }, { ...SABLONY.bojler, id: 'b', conflicts: [], enabled: true }];
+  const bez = backtest(historie, cfg, a).perMonth;
+  const s = backtest(historie, { ...cfg, maxKw: 3.5 }, a).perMonth;
+  assert.ok(s <= bez + 1e-9, `${s} > ${bez}`);
+});
+
+t('rozpis výroby z panelů po hodinách sedí s celkovým součtem', () => {
+  const pv = [...nula]; pv[12] = 1.5; pv[13] = 0.2;
+  const r = optimize({ prices: ceny, pv, baseLoad: nula, feedIn: 0,
+    appliances: [{ ...SABLONY.bojler, id: 'b', conflicts: [], enabled: true }] });
+  const p = r.plan[0];
+  const soucet = Object.values(p.pvPoHodinach).reduce((a, b) => a + b, 0);
+  assert.ok(Math.abs(soucet - p.pvUsed) < 1e-9);
+  assert.ok(p.pvPoHodinach[12] >= p.naHodinu * 0.5 && p.pvPoHodinach[13] < p.naHodinu * 0.5);
+});
+
+console.log('\núpravy seznamu spotřebičů:');
+t('zákaz souběhu se nastaví i zruší na obou stranách', () => {
+  let l = [{ id: 'a', conflicts: [] }, { id: 'b', conflicts: [] }];
+  l = prepniKonflikt(l, 'a', 'b');
+  assert.deepStrictEqual([l[0].conflicts, l[1].conflicts], [['b'], ['a']]);
+  l = prepniKonflikt(l, 'b', 'a');
+  assert.deepStrictEqual([l[0].conflicts, l[1].conflicts], [[], []]);
+});
+t('odebraný spotřebič zmizí i ze zákazů ostatních', () => {
+  const l = odeberSpotrebic([{ id: 'a', conflicts: ['b'] }, { id: 'b', conflicts: ['a'] }], 'b');
+  assert.deepStrictEqual(l, [{ id: 'a', conflicts: [] }]);
+});
+t('nový spotřebič ze šablony má jedinečné id', () => {
+  const s1 = novySpotrebic('susicka', []);
+  const s2 = novySpotrebic('susicka', [s1]);
+  assert.strictEqual(s1.id, 'susicka'); assert.strictEqual(s2.id, 'susicka2'); assert.strictEqual(s2.kw, 2.5);
+});
+t('staré uložené spotřebiče dostanou příkon podle šablony', () => {
+  const [x] = doplnSpotrebice([{ id: 'bojler', name: 'Bojler', kwh: 6, hours: 3 }]);
+  assert.strictEqual(x.kw, 2); assert.deepStrictEqual(x.conflicts, []);
+});
+t('neplatné odkazy v zákazech se při načtení vyčistí', () => {
+  const [x] = doplnSpotrebice([{ id: 'a', kwh: 1, hours: 1, conflicts: ['neexistuje'] }]);
+  assert.deepStrictEqual(x.conflicts, []);
+});
+t('všechny šablony jsou fyzikálně možné (příkon ≥ spotřeba za hodinu)', () => {
+  for (const [k, v] of Object.entries(SABLONY)) assert.ok(v.kw >= v.kwh / v.hours - 1e-9, k);
 });
 
 await Promise.all(cekajici);

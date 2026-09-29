@@ -6,6 +6,7 @@ import {
   toFinalPrices, optimize, actionFor, odpocet, dayCharacter, buildIcs, isoDay,
   cheapestWindow, oknoPopis, tier, hoursLabel, pad, dni, czDate, backtest,
   PROFILY, VYCHOZI_PROFIL, mesicniPrehled, csvHodiny, csvDny,
+  SABLONY, novySpotrebic, doplnSpotrebice, prepniKonflikt, odeberSpotrebic,
 } from "./logika.js";
 import {
   PREMIUM_CENA, PLATBA_URL, FORMULAR_URL, GOATCOUNTER_KOD, DODAVATELE,
@@ -38,6 +39,7 @@ const DEFAULT_CFG = {
   distributor: "CEZ", rate: "D02d", margin: 0, marginPct: 0,
   systemFees: SYSTEM_FEES, kwp: 0, feedIn: 0.6, flatPrice: null,
   baseLoadPerHour: 0.3, ntHours: null,
+  maxKw: null, // limit souběžného příkonu v kW, null = bez limitu
   dodavatel: "spot", // "spot" = bez přirážky, "vlastni" = zadaná ručně, jinak id z DODAVATELE
 };
 
@@ -103,7 +105,7 @@ export default function App() {
       const v = JSON.parse(raw);
       if (v.cfg) setCfg((c) => ({ ...c, ...v.cfg }));
       if (v.profil) setProfil(v.profil);
-      if (v.appliances?.length) setAppliances(v.appliances);
+      if (v.appliances?.length) setAppliances(doplnSpotrebice(v.appliances));
     } catch { /* poškozené, jedeme na výchozím */ }
   }, []);
   const uloz = (p, c, a) => store.set(KLIC, JSON.stringify({ profil: p, cfg: c, appliances: a }));
@@ -154,8 +156,9 @@ export default function App() {
   const pvDne = (isToday ? dnesD : zitraD)?.pv ?? [];
   const pv = useMemo(() => pvDne.map((v) => Math.round((v ?? 0) * cfg.kwp * 100) / 100), [pvDne, cfg.kwp]);
   const baseLoad = useMemo(() => new Array(24).fill(cfg.baseLoadPerHour), [cfg.baseLoadPerHour]);
-  const opt = useMemo(() => prices ? optimize({ prices, pv, baseLoad, feedIn: cfg.feedIn, appliances }) : null,
-    [prices, pv, baseLoad, cfg.feedIn, appliances]);
+  const opt = useMemo(() => prices
+    ? optimize({ prices, pv, baseLoad, feedIn: cfg.feedIn, appliances, maxKw: cfg.maxKw })
+    : null, [prices, pv, baseLoad, cfg.feedIn, cfg.maxKw, appliances]);
 
   // úspory ze skutečné historie: pro zvolené nastavení i pro každou předvolbu
   const bt = useMemo(() => backtest(historie, cfgEff, appliances), [historie, cfgEff, appliances]);
@@ -173,12 +176,12 @@ export default function App() {
   };
   const toggle = (id) => setApps(appliances.map((a) => a.id === id ? { ...a, enabled: !a.enabled } : a));
   const patchApp = (id, p) => setApps(appliances.map((a) => a.id === id ? { ...a, ...p } : a));
-  const addApp = () => {
-    const id = `vlastni${Date.now()}`;
-    setApps([...appliances, { id, name: "Nový spotřebič", kwh: 2, hours: 2, contiguous: false,
-      earliest: 0, latest: 24, priority: 50, enabled: true }]);
-    setEditing(id);
+  const addApp = (sablona = "vlastni") => {
+    const novy = novySpotrebic(sablona, appliances);
+    setApps([...appliances, novy]);
+    setEditing(novy.id);
   };
+  const toggleConflict = (a, b) => setApps(prepniKonflikt(appliances, a, b));
 
   // Dokud nejsou data, žádná čísla.
   if (!data) {
@@ -229,7 +232,8 @@ export default function App() {
               </p>
             </div>
             <HourMap prices={prices} plan={active} showNow={isToday} />
-            <DayBand prices={prices} pv={pv} plan={active} avg={opt.avg} showNow={isToday} />
+            <DayBand prices={prices} pv={pv} plan={active} avg={opt.avg} showNow={isToday}
+              spicka={opt.spicka} limit={opt.limit} />
           </section>
         </>
       ) : (
@@ -268,7 +272,8 @@ export default function App() {
         {tab === "spotrebice" && opt && (
           <Appliances appliances={appliances} plan={opt.plan} editing={editing}
             setEditing={setEditing} toggle={toggle} patchApp={patchApp}
-            remove={(id) => setApps(appliances.filter((a) => a.id !== id))} add={addApp} />
+            remove={(id) => setApps(odeberSpotrebic(appliances, id))} add={addApp}
+            toggleConflict={toggleConflict} cfg={cfg} update={update} />
         )}
         {tab === "cena" && prices && <PriceTab cfg={cfg} update={update} prices={prices} eurCzk={dnesD?.eurCzk} />}
         {tab === "premium" && <Premium bt={bt} />}
@@ -290,6 +295,33 @@ export default function App() {
       </footer>
     </div>
   );
+}
+
+// ═══ Vysvětlení omezení ════════════════════════════════════════
+// Názvy spotřebičů si píše uživatel, takže je nejde skloňovat. Proto
+// "kvůli spotřebiči Myčka": název zůstává v prvním pádě a věta sedí vždy.
+const vycet = (j) => j.length <= 1 ? (j[0] ?? "") : `${j.slice(0, -1).join(", ")} a ${j[j.length - 1]}`;
+const kvuliSpotrebici = (j) => `${j.length === 1 ? "spotřebiči" : "spotřebičům"} ${vycet(j)}`;
+
+function popisPosunu(p) {
+  const d = p.posunuto;
+  const casti = [];
+  if (d.soubeh.length) casti.push(kvuliSpotrebici(d.soubeh));
+  if (d.limit) casti.push("limitu příkonu");
+  const pripl = p.priplatek >= 0.5 ? `, o ${fmtCzk(p.priplatek)} dráž` : "";
+  return `Posunuto kvůli ${vycet(casti)}${pripl}.`;
+}
+
+function popisNelze(p) {
+  if (p.duvod === "okno") return "Časové okno je kratší než jeho cyklus.";
+  if (p.duvod === "prikon") return `Potřebuje ${fmt(p.kw, 1)} kW a spolu se základní spotřebou domu se nevejde do limitu ${fmt(p.limit, 1)} kW. Zvyš limit, nebo prodluž cyklus, aby stačil menší příkon.`;
+  const d = p.omezeni ?? { soubeh: [], limit: false };
+  const casti = [];
+  if (d.soubeh.length) casti.push(kvuliSpotrebici(d.soubeh));
+  if (d.limit) casti.push("limitu příkonu");
+  return casti.length
+    ? `V povoleném čase se nevejde kvůli ${vycet(casti)}. Zkus mu rozšířit časové okno.`
+    : "V povoleném čase se nevejde. Zkus mu rozšířit časové okno.";
 }
 
 // ═══ Hlavička se stavem dat ════════════════════════════════════
@@ -447,6 +479,7 @@ function ActionBoard({ plan, prices, avg, now, isToday, day, setDay, hasTomorrow
     });
 
   const teded = polozky.filter((x) => x.a.kind === "now");
+  const nejdou = plan.filter((p) => p.infeasible);
 
   return (
     <section className="board">
@@ -520,9 +553,16 @@ function ActionBoard({ plan, prices, avg, now, isToday, day, setDay, hasTomorrow
               <p className="cardCost">
                 {fmtCzk(p.cost)}{p.pvUsed > 0.05 && `, z toho ${fmt(p.pvUsed, 1)} kWh z panelů`}
               </p>
+              {p.posunuto && <p className="cardNote">{popisPosunu(p)}</p>}
             </li>
           ))}
         </ul>
+      )}
+
+      {nejdou.length > 0 && (
+        <div className="boardWarn" role="note">
+          {nejdou.map((p) => <p key={p.id}><strong>{p.name}</strong> se nepodařilo naplánovat. {popisNelze(p)}</p>)}
+        </div>
       )}
 
       {polozky.length > 0 && (
@@ -537,100 +577,116 @@ function ActionBoard({ plan, prices, avg, now, isToday, day, setDay, hasTomorrow
   );
 }
 
-// ═══ Hero: 24 hodin jako pásmo dne ═════════════════════════════
-function DayBand({ prices, pv, plan, avg, showNow = true }) {
-  const W = 1000, H = 300;
-  const PAD = { l: 8, r: 8, t: 34, b: 66 };
-  const iw = W - PAD.l - PAD.r;
-  const bandTop = PAD.t, bandH = H - PAD.t - PAD.b;
-
+// ═══ Průběh dne: graf ceny a rozvrh spotřebičů ════════════════
+/**
+ * Graf je obrázek bez jediného textu. Všechny popisky (časová osa,
+ * značka "teď", názvy spotřebičů) jsou běžné HTML v mřížce, takže se
+ * nezmenšují na nečitelnou velikost a nemohou se navzájem překrýt:
+ * každý druh popisku má vlastní řádek nebo sloupec.
+ */
+function DayBand({ prices, pv, plan, avg, showNow = true, spicka, limit }) {
+  const N = prices.length;                    // 23, 24 nebo 25 hodin
+  const W = 1000, V = 220;                     // souřadnice obrázku, roztahuje se do šířky
   const vals = prices.map((p) => p.price);
-  const lo = Math.min(0, ...vals), hi = Math.max(...vals) * 1.12;
-  const x = (h) => PAD.l + (h / 24) * iw;
-  const y = (v) => bandTop + bandH - ((v - lo) / (hi - lo)) * bandH * 0.82;
+  const lo = Math.min(0, ...vals), hi = Math.max(...vals) * 1.1;
+  const x = (h) => (h / N) * W;
+  const y = (v) => V - 8 - ((v - lo) / (hi - lo || 1)) * (V - 24);
 
-  let curve = `M ${x(0)} ${y(vals[0])}`;
-  for (let h = 0; h < 24; h++) curve += ` L ${x(h)} ${y(vals[h])} L ${x(h + 1)} ${y(vals[h])}`;
+  let krivka = `M ${x(0)} ${y(vals[0])}`;
+  for (let h = 0; h < N; h++) krivka += ` L ${x(h)} ${y(vals[h])} L ${x(h + 1)} ${y(vals[h])}`;
 
   const maxPv = Math.max(0.01, ...pv);
-  const nowH = new Date().getHours();
-  const nowM = new Date().getMinutes();
-  const nowX = x(nowH + nowM / 60);
+  const ted = new Date();
+  const tedH = ted.getHours() + ted.getMinutes() / 60;
+  const tedPct = (tedH / N) * 100;
+  const tedText = `${ted.getHours()}:${String(ted.getMinutes()).padStart(2, "0")}`;
+  const naplanovano = new Set(plan.flatMap((p) => p.hours));
+  const osa = Array.from({ length: Math.floor(N / 3) + 1 }, (_, i) => i * 3).filter((h) => h <= N);
+  if (osa[osa.length - 1] !== N) osa.push(N);
 
   return (
-    <div className="bandWrap">
-      <svg viewBox={`0 0 ${W} ${H}`} className="band" role="img"
-        aria-label="Průběh ceny elektřiny během dne a naplánované spotřebiče">
-        <defs>
-          <linearGradient id="sky" x1="0" x2="1">
-            <stop offset="0%"   stopColor="#121A2E" />
-            <stop offset="20%"  stopColor="#1B2647" />
-            <stop offset="33%"  stopColor="#3C4A78" />
-            <stop offset="50%"  stopColor="#6E7FB0" />
-            <stop offset="62%"  stopColor="#8FA0C9" />
-            <stop offset="75%"  stopColor="#4F5C8E" />
-            <stop offset="88%"  stopColor="#1E2949" />
-            <stop offset="100%" stopColor="#121A2E" />
-          </linearGradient>
-          <linearGradient id="sunGlow" x1="0" y1="1" x2="0" y2="0">
-            <stop offset="0%" stopColor="#F0B429" stopOpacity="0.55" />
-            <stop offset="100%" stopColor="#F0B429" stopOpacity="0" />
-          </linearGradient>
-          <clipPath id="bandClip">
-            <rect x={PAD.l} y={bandTop} width={iw} height={bandH} rx="14" />
-          </clipPath>
-        </defs>
+    <div className="db">
+      {showNow && (
+        <div className="dbRow">
+          <span className="dbG" />
+          <div className="dbNowRow">
+            <span className="dbNow" style={{ left: `clamp(34px, ${tedPct}%, calc(100% - 34px))` }}>teď {tedText}</span>
+          </div>
+        </div>
+      )}
 
-        <g clipPath="url(#bandClip)">
-          <rect x={PAD.l} y={bandTop} width={iw} height={bandH} fill="url(#sky)" />
+      <div className="dbRow">
+        <span className="dbG" />
+        <div className="dbPlot">
+          <svg viewBox={`0 0 ${W} ${V}`} preserveAspectRatio="none" className="dbSvg"
+            role="img" aria-label="Průběh ceny elektřiny během dne">
+            <defs>
+              <linearGradient id="sky" x1="0" x2="1">
+                <stop offset="0%" stopColor="#121A2E" /><stop offset="20%" stopColor="#1B2647" />
+                <stop offset="33%" stopColor="#3C4A78" /><stop offset="50%" stopColor="#6E7FB0" />
+                <stop offset="62%" stopColor="#8FA0C9" /><stop offset="75%" stopColor="#4F5C8E" />
+                <stop offset="88%" stopColor="#1E2949" /><stop offset="100%" stopColor="#121A2E" />
+              </linearGradient>
+              <linearGradient id="sunGlow" x1="0" y1="1" x2="0" y2="0">
+                <stop offset="0%" stopColor="#F0B429" stopOpacity="0.55" />
+                <stop offset="100%" stopColor="#F0B429" stopOpacity="0" />
+              </linearGradient>
+            </defs>
+            <rect x="0" y="0" width={W} height={V} fill="url(#sky)" />
+            {pv.map((v, h) => v > 0.02 && h < N && (
+              <rect key={`pv${h}`} x={x(h)} y={V * 0.45} width={W / N} height={V * 0.55}
+                fill="url(#sunGlow)" opacity={v / maxPv} />
+            ))}
+            {[...naplanovano].map((h) => (
+              <rect key={`s${h}`} x={x(h)} y="0" width={W / N} height={V} fill="#fff" opacity="0.11" />
+            ))}
+            <line x1="0" x2={W} y1={y(avg)} y2={y(avg)} stroke="#fff" strokeOpacity="0.3"
+              strokeWidth="1" strokeDasharray="4 6" vectorEffect="non-scaling-stroke" />
+            <path d={krivka} fill="none" stroke="#fff" strokeWidth="2.4" strokeLinejoin="round"
+              vectorEffect="non-scaling-stroke" className="curve" />
+            {showNow && <line x1={x(tedH)} x2={x(tedH)} y1="0" y2={V} stroke="#F0B429"
+              strokeWidth="2" vectorEffect="non-scaling-stroke" />}
+          </svg>
+        </div>
+      </div>
 
-          {/* výroba z panelů jako světlo zespodu */}
-          {pv.map((v, h) => v > 0.02 && (
-            <rect key={`pv${h}`} x={x(h)} y={bandTop + bandH * 0.45} width={iw / 24}
-              height={bandH * 0.55} fill="url(#sunGlow)" opacity={v / maxPv} />
+      <div className="dbRow">
+        <span className="dbG" />
+        <div className="dbAxis" aria-hidden="true">
+          {osa.map((h) => (
+            <span key={h} className={h === 0 ? "ax axFirst" : h === N ? "ax axLast" : "ax"}
+              style={{ left: `${(h / N) * 100}%` }}>{h}</span>
           ))}
+        </div>
+      </div>
 
-          {/* hodiny vybrané pro spotřebiče */}
-          {plan.flatMap((p) => p.hours.map((h) => (
-            <rect key={`s${p.id}${h}`} x={x(h)} y={bandTop} width={iw / 24} height={bandH}
-              fill="#fff" opacity="0.11" />
-          )))}
-
-          <line x1={PAD.l} x2={W - PAD.r} y1={y(avg)} y2={y(avg)}
-            stroke="#fff" strokeOpacity="0.28" strokeWidth="1" strokeDasharray="3 5" />
-
-          <path d={curve} fill="none" stroke="#fff" strokeWidth="2.4"
-            strokeLinejoin="round" className="curve" />
-
-          {showNow && <line x1={nowX} x2={nowX} y1={bandTop} y2={bandTop + bandH}
-            stroke="#F0B429" strokeWidth="2" />}
-        </g>
-
-        <text x={x(3)} y={bandTop - 12} className="bandTick">noc</text>
-        <text x={x(12)} y={bandTop - 12} className="bandTick">poledne</text>
-        <text x={x(21)} y={bandTop - 12} className="bandTick">večer</text>
-        {showNow && <text x={nowX} y={bandTop - 12} className="bandNow" textAnchor="middle">teď</text>}
-
-        {/* rozvrh pod pásmem, na stejné časové ose */}
-        {plan.map((p, i) => {
-          const ry = bandTop + bandH + 14 + i * 15;
-          if (i > 2) return null;
-          return (
-            <g key={p.id}>
-              {p.hours.map((h) => (
-                <rect key={h} x={x(h) + 1} y={ry} width={iw / 24 - 2} height={10} rx="3"
-                  fill={p.pvUsed > 0.05 ? "var(--sun)" : "var(--save)"} />
-              ))}
-              <text x={x(p.hours[0]) + 2} y={ry - 3} className="rowName">{p.name}</text>
-            </g>
-          );
-        })}
-      </svg>
+      {plan.length > 0 && (
+        <div className="gantt" role="list" aria-label="Rozvrh spotřebičů">
+          {plan.map((p) => (
+            <div key={p.id} className="gRow" role="listitem">
+              <span className="gName" title={p.name}>{p.name}</span>
+              <div className="gTrack" style={{ gridTemplateColumns: `repeat(${N}, 1fr)` }}
+                title={`${p.name}: ${hoursLabel(p.hours)}`}>
+                {Array.from({ length: N }, (_, h) => {
+                  if (!p.hours.includes(h)) return <span key={h} className="gCell" />;
+                  // žlutě jen hodiny, kdy panely pokryjí aspoň polovinu spotřeby
+                  const zPanelu = (p.pvPoHodinach?.[h] ?? 0) >= (p.naHodinu ?? 1) * 0.5;
+                  return <span key={h} className={zPanelu ? "gCell on sun" : "gCell on"} />;
+                })}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
 
       <div className="bandLegend">
         <span><i className="sw swSave" />plán ze sítě</span>
-        <span><i className="sw swSun" />kryto panely</span>
-        {plan.length > 3 && <span>a další {plan.length - 3} v přehledu níž</span>}
+        {plan.some((p) => p.hours.some((h) => (p.pvPoHodinach?.[h] ?? 0) >= (p.naHodinu ?? 1) * 0.5)) &&
+          <span><i className="sw swSun" />většinou z panelů</span>}
+        <span><i className="sw swAvg" />průměrná cena dne</span>
+        {limit != null && (
+          <span>nejvyšší souběžný příkon {fmt(spicka, 1)} kW z limitu {fmt(limit, 1)} kW</span>
+        )}
       </div>
     </div>
   );
@@ -651,14 +707,56 @@ function ProofBars({ days }) {
   );
 }
 
+// ═══ Limit příkonu domu ════════════════════════════════════════
+const LIMITY = [
+  { kw: null, text: "Bez limitu" },
+  { kw: 3.5, text: "3,5 kW", popis: "jeden okruh 16 A" },
+  { kw: 5.5, text: "5,5 kW", popis: "jistič 25 A na fázi" },
+  { kw: 7.5, text: "7,5 kW" },
+];
+
+function LimitBox({ cfg, update }) {
+  const vlastni = cfg.maxKw != null && !LIMITY.some((l) => l.kw === cfg.maxKw);
+  return (
+    <div className="limitBox">
+      <p className="limitTitle">Kolik smí běžet najednou</p>
+      <p className="fieldNote">
+        Když ti při zapnutí víc spotřebičů najednou padají pojistky, nastav limit a plán
+        spotřebiče rozloží tak, aby se nesešly. Počítá se i se základní spotřebou domu
+        {` ${fmt(cfg.baseLoadPerHour, 1)} kW`}. Jeden okruh s jističem 16 A unese asi 3,5 kW.
+      </p>
+      <div className="chips" role="radiogroup" aria-label="Limit příkonu">
+        {LIMITY.map((l) => (
+          <button key={l.text} role="radio" aria-checked={cfg.maxKw === l.kw}
+            className={cfg.maxKw === l.kw ? "chip chipOn" : "chip"} onClick={() => update({ maxKw: l.kw })}>
+            {l.text}{l.popis && <span className="chipSub">{l.popis}</span>}
+          </button>
+        ))}
+        <label className={vlastni ? "chip chipOn chipInput" : "chip chipInput"}>
+          <span>Vlastní</span>
+          <input type="number" min="0.5" step="0.1" inputMode="decimal" aria-label="Vlastní limit v kW"
+            value={vlastni ? cfg.maxKw : ""} placeholder="kW"
+            onChange={(e) => update({ maxKw: e.target.value === "" ? null : Math.max(0.5, +e.target.value) })} />
+        </label>
+      </div>
+    </div>
+  );
+}
+
 // ═══ Spotřebiče ════════════════════════════════════════════════
-function Appliances({ appliances, plan, editing, setEditing, toggle, patchApp, remove, add }) {
+function Appliances({ appliances, plan, editing, setEditing, toggle, patchApp, remove, add, toggleConflict, cfg, update }) {
+  const [sablona, setSablona] = useState("susicka");
+  const jmeno = (id) => appliances.find((x) => x.id === id)?.name ?? id;
   return (
     <div>
+      <LimitBox cfg={cfg} update={update} />
+
       <ul className="applList">
         {appliances.map((a) => {
           const p = plan.find((x) => x.id === a.id);
           const open = editing === a.id;
+          const ostatni = appliances.filter((x) => x.id !== a.id);
+          const zakazy = (a.conflicts ?? []).filter((c) => appliances.some((x) => x.id === c));
           return (
             <li key={a.id} className={a.enabled ? "appl" : "appl applOff"}>
               <div className="applRow">
@@ -669,20 +767,25 @@ function Appliances({ appliances, plan, editing, setEditing, toggle, patchApp, r
                 <div className="applInfo">
                   <p className="applName">{a.name}</p>
                   <p className="applMeta">
-                    {fmt(a.kwh, 1)} kWh za {a.hours} h
+                    {fmt(a.kwh, 1)} kWh za {a.hours} h, příkon {fmt(Math.max(a.kw ?? 0, a.kwh / a.hours), 1)} kW
                     {a.contiguous ? ", nepřerušitelný cyklus" : ", lze rozdělit"}
                   </p>
+                  {zakazy.length > 0 && (
+                    <p className="applMeta">Nesmí běžet zároveň s: {vycet(zakazy.map(jmeno))}</p>
+                  )}
                 </div>
                 <div className="applWhen">
                   {a.enabled && p && !p.infeasible && (
                     <>
                       <p className="whenTime">{hoursLabel(p.hours)}</p>
                       <p className="whenCost">{fmtCzk(p.cost)}</p>
+                      {p.posunuto && <p className="whenNote">{popisPosunu(p)}</p>}
                     </>
                   )}
-                  {p?.infeasible && <p className="whenBad">okno je kratší než cyklus</p>}
+                  {p?.infeasible && <p className="whenBad">{popisNelze(p)}</p>}
                 </div>
-                <button className="linkBtn" onClick={() => setEditing(open ? null : a.id)}>
+                <button className="linkBtn" onClick={() => setEditing(open ? null : a.id)}
+                  aria-expanded={open}>
                   {open ? "hotovo" : "upravit"}
                 </button>
               </div>
@@ -695,17 +798,51 @@ function Appliances({ appliances, plan, editing, setEditing, toggle, patchApp, r
                     value={a.kwh} onChange={(e) => patchApp(a.id, { kwh: Math.max(0.1, +e.target.value) })} /></Field>
                   <Field label="Délka cyklu v hodinách"><input type="number" min="1" max="24"
                     value={a.hours} onChange={(e) => patchApp(a.id, { hours: clamp(+e.target.value, 1, 24) })} /></Field>
-                  <Field label="Ne dřív než"><input type="number" min="0" max="23"
+                  <Field label="Příkon při běhu v kW, najdeš na štítku">
+                    <input type="number" min="0.1" step="0.1"
+                      value={a.kw ?? ""} onChange={(e) => patchApp(a.id, { kw: Math.max(0.1, +e.target.value || 0) })} />
+                  </Field>
+                  {(a.kw ?? 0) < a.kwh / a.hours - 1e-9 && (
+                    <p className="fieldNote editNote warnNote">
+                      Při příkonu {fmt(a.kw, 1)} kW nejde za {a.hours} h odebrat {fmt(a.kwh, 1)} kWh, na to je potřeba
+                      aspoň {fmt(a.kwh / a.hours, 1)} kW. Počítám proto s {fmt(a.kwh / a.hours, 1)} kW. Když má
+                      spotřebič opravdu menší příkon, prodluž délku cyklu na {Math.ceil(a.kwh / a.kw)} h.
+                    </p>
+                  )}
+                  <Field label="Ne dřív než (hodina)"><input type="number" min="0" max="23"
                     value={a.earliest} onChange={(e) => patchApp(a.id, { earliest: clamp(+e.target.value, 0, 23) })} /></Field>
-                  <Field label="Hotovo do"><input type="number" min="1" max="24"
+                  <Field label="Hotovo do (hodina)"><input type="number" min="1" max="24"
                     value={a.latest} onChange={(e) => patchApp(a.id, { latest: clamp(+e.target.value, 1, 24) })} /></Field>
-                  <Field label="Přednost na přebytek z panelů"><input type="number" min="1" max="99"
+                  <Field label="Přednost při plánování, 1 je nejvyšší"><input type="number" min="1" max="99"
                     value={a.priority} onChange={(e) => patchApp(a.id, { priority: clamp(+e.target.value, 1, 99) })} /></Field>
                   <label className="check">
                     <input type="checkbox" checked={a.contiguous}
                       onChange={(e) => patchApp(a.id, { contiguous: e.target.checked })} />
                     Cyklus nejde přerušit, třeba pračka nebo myčka
                   </label>
+
+                  {ostatni.length > 0 && (
+                    <fieldset className="conf">
+                      <legend>Nesmí běžet zároveň s</legend>
+                      <p className="fieldNote">
+                        Třeba myčka a sušička na jednom okruhu. Plán je pak nikdy nepustí ve stejnou hodinu.
+                      </p>
+                      <div className="confList">
+                        {ostatni.map((o) => (
+                          <label key={o.id} className="check">
+                            <input type="checkbox"
+                              checked={(a.conflicts ?? []).includes(o.id) || (o.conflicts ?? []).includes(a.id)}
+                              onChange={() => toggleConflict(a.id, o.id)} />
+                            {o.name}
+                          </label>
+                        ))}
+                      </div>
+                    </fieldset>
+                  )}
+
+                  <p className="fieldNote editNote">
+                    Kdo má vyšší přednost, dostane nejlevnější hodiny a přebytek z panelů jako první.
+                  </p>
                   <button className="btn btnDanger" onClick={() => { setEditing(null); remove(a.id); }}>
                     Odebrat spotřebič
                   </button>
@@ -715,7 +852,14 @@ function Appliances({ appliances, plan, editing, setEditing, toggle, patchApp, r
           );
         })}
       </ul>
-      <button className="btn btnSolid" onClick={add}>Přidat spotřebič</button>
+
+      <div className="addRow">
+        <label className="addLbl" htmlFor="sablona">Přidat spotřebič</label>
+        <select id="sablona" value={sablona} onChange={(e) => setSablona(e.target.value)}>
+          {Object.entries(SABLONY).map(([k, v]) => <option key={k} value={k}>{v.name}</option>)}
+        </select>
+        <button className="btn btnSolid" onClick={() => add(sablona)}>Přidat</button>
+      </div>
     </div>
   );
 }
@@ -969,12 +1113,12 @@ function Historie({ bt, historie, cfgEff, todayPrices, tomorrowPrices }) {
 
       <div className="tblWrap">
         <table className="tbl">
-          <thead><tr><th>Měsíc</th><th>Dní</th><th>Ušetřeno plánem</th><th>Průměrná cena</th></tr></thead>
+          <thead><tr><th>Měsíc</th><th className="colDni">Dní</th><th>Ušetřeno</th><th>Cena za kWh</th></tr></thead>
           <tbody>
             {mesice.map((m) => (
               <tr key={m.mesic}>
                 <td>{nazevMesice(m.mesic)}</td>
-                <td>{m.dnu}</td>
+                <td className="colDni">{m.dnu}</td>
                 <td className="num">{fmtCzk(m.usetreno)}</td>
                 <td className="num">{fmt(m.prumerCen)} Kč</td>
               </tr>
@@ -1077,8 +1221,8 @@ const CSS = `
 *{box-sizing:border-box}
 body{margin:0}
 .app{background:var(--paper);color:var(--ink);font-family:var(--body);min-height:100vh;padding-bottom:56px}
-h1,h2,h3{font-family:var(--display);font-weight:700;letter-spacing:-0.02em;margin:0}
-h1{font-size:clamp(26px,3.4vw,38px);line-height:1.1}
+h1,h2,h3{font-family:var(--display);font-weight:700;letter-spacing:-0.02em;margin:0;line-height:1.2}
+h1{font-size:clamp(26px,3.4vw,38px);line-height:1.2}
 h2{font-size:clamp(20px,2.4vw,26px)}
 h3{font-size:17px;margin-bottom:14px}
 p{margin:0}
@@ -1164,7 +1308,7 @@ button{font-family:var(--body)}
 .dt:disabled{opacity:.45;cursor:not-allowed}
 .dtOn{background:var(--card);color:var(--ink);box-shadow:0 1px 3px rgba(20,30,50,.12)}
 .boardHint{font-size:12.5px;color:var(--dim)}
-.boardHead{font-size:clamp(28px,4.2vw,44px);line-height:1.05;letter-spacing:-0.03em}
+.boardHead{font-size:clamp(28px,4.2vw,44px);line-height:1.18;letter-spacing:-0.03em}
 .boardHead em{font-style:normal;color:var(--save)}
 .boardSub{color:var(--dim);font-size:15px;margin-top:8px}
 .dayFlag{margin-top:16px;padding:12px 15px;border-radius:12px;font-size:13.5px;line-height:1.5;max-width:64ch}
@@ -1176,7 +1320,7 @@ button{font-family:var(--body)}
 .card{border-radius:16px;padding:16px 17px;border:1px solid var(--line);background:var(--card)}
 .cardName{font-weight:600;font-size:14px;color:var(--dim)}
 .cardTime{font-family:var(--display);font-size:24px;font-weight:700;letter-spacing:-0.02em;
-  margin-top:6px;line-height:1.15}
+  margin-top:6px;line-height:1.25}
 .cardStatus{font-size:14px;font-weight:600;margin-top:10px}
 .cardCost{font-size:12.5px;color:var(--dim);margin-top:4px}
 .card-now{background:var(--save);border-color:var(--save);color:#fff}
@@ -1193,14 +1337,14 @@ button{font-family:var(--body)}
   padding:clamp(20px,3vw,30px);box-shadow:0 1px 2px rgba(20,30,50,.05)}
 .heroHead{max-width:62ch}
 .lede{color:var(--dim);font-size:15.5px;line-height:1.55;margin-top:10px}
-.bandWrap{margin-top:22px}
-.band{width:100%;display:block;border-radius:14px;overflow:visible}
+
+
 .curve{stroke-dasharray:2600;stroke-dashoffset:2600;animation:draw 1.3s cubic-bezier(.4,0,.2,1) forwards}
 @keyframes draw{to{stroke-dashoffset:0}}
 @media (prefers-reduced-motion:reduce){.curve{animation:none;stroke-dasharray:none;stroke-dashoffset:0}}
-.bandTick{font-family:var(--body);font-size:12px;fill:var(--dim)}
-.bandNow{font-family:var(--body);font-size:12px;font-weight:700;fill:#B3811A}
-.rowName{font-family:var(--body);font-size:11px;fill:var(--dim)}
+
+
+
 .bandLegend{display:flex;gap:18px;flex-wrap:wrap;font-size:12.5px;color:var(--dim);margin-top:10px}
 .bandLegend .sw{width:11px;height:11px;border-radius:3px;display:inline-block;margin-right:6px;
   vertical-align:-1px}
@@ -1209,7 +1353,7 @@ button{font-family:var(--body)}
 .heroFoot{margin-top:20px;padding-top:18px;border-top:1px solid var(--line)}
 .saving{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
 .savingNum{font-family:var(--display);font-size:clamp(30px,4.4vw,44px);font-weight:700;
-  color:var(--save);letter-spacing:-0.03em;line-height:1}
+  color:var(--save);letter-spacing:-0.03em;line-height:1.15}
 .savingLbl{color:var(--dim);font-size:14px;max-width:34ch;line-height:1.45}
 
 .proof{margin:18px clamp(16px,4vw,40px) 0;background:var(--night);color:#E8EDF6;
@@ -1235,7 +1379,7 @@ button{font-family:var(--body)}
 .tagReal{background:rgba(110,231,183,.16);color:#6EE7B7}
 .tagDemo{background:rgba(240,180,41,.18);color:#F0B429}
 .bigMoney{font-family:var(--display);font-size:clamp(38px,6vw,60px);font-weight:700;
-  letter-spacing:-0.035em;line-height:1;color:#6EE7B7}
+  letter-spacing:-0.035em;line-height:1.15;color:#6EE7B7}
 .bigMoneyLbl{color:#A8B4CA;font-size:13.5px;margin-top:10px;max-width:30ch;line-height:1.5}
 .bars{display:flex;align-items:flex-end;gap:3px;height:110px}
 .barCol{flex:1;height:100%;display:flex;align-items:flex-end}
@@ -1325,7 +1469,7 @@ input:focus,select:focus{border-color:var(--save)}
 }
 
 .uspory{margin-top:6px}
-.usporyHead{color:#fff;font-size:clamp(24px,3.4vw,36px);line-height:1.12;letter-spacing:-0.025em;max-width:24ch}
+.usporyHead{color:#fff;font-size:clamp(24px,3.4vw,36px);line-height:1.2;letter-spacing:-0.025em;max-width:24ch}
 .profily{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px;margin-top:22px}
 .prof{text-align:left;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.14);
   color:#E8EDF6;border-radius:14px;padding:12px 14px;cursor:pointer;display:flex;flex-direction:column;gap:3px;
@@ -1367,4 +1511,66 @@ input:focus,select:focus{border-color:var(--save)}
 .tbl .num{font-variant-numeric:tabular-nums;text-align:right}
 .tbl th:nth-child(n+3){text-align:right}
 .footLink{color:var(--save);font-weight:600}
+
+.db{margin-top:22px;--gw:clamp(7.5rem,20%,11.5rem)}
+.dbRow{display:grid;grid-template-columns:var(--gw) minmax(0,1fr);column-gap:12px}
+.dbNowRow{position:relative;height:26px}
+.dbNow{position:absolute;bottom:4px;transform:translateX(-50%);white-space:nowrap;
+  font-size:12px;font-weight:700;color:#7A4E00;background:#FDF0CF;border:1px solid #F1D794;
+  padding:2px 8px;border-radius:999px}
+.dbPlot{border-radius:14px;overflow:hidden;line-height:0}
+.dbSvg{width:100%;height:190px;display:block}
+.dbAxis{position:relative;height:22px;margin-top:4px}
+.ax{position:absolute;top:2px;transform:translateX(-50%);font-size:12px;color:var(--dim);
+  font-variant-numeric:tabular-nums;line-height:1}
+.axFirst{transform:none}
+.axLast{transform:translateX(-100%)}
+.gantt{display:grid;gap:7px;margin-top:10px}
+.gRow{display:grid;grid-template-columns:var(--gw) minmax(0,1fr);column-gap:12px;align-items:center}
+.gName{font-size:13px;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.gTrack{display:grid;gap:2px}
+.gCell{height:14px;border-radius:3px;background:#EDF1F5}
+.gCell.on{background:var(--save)}
+.gCell.sun{background:var(--sun)}
+.swAvg{background:transparent !important;border-top:2px dashed #9AA6BD;height:0 !important;width:14px !important;vertical-align:3px !important}
+@media (max-width:560px){
+  .dbRow,.gRow{grid-template-columns:minmax(0,1fr)}
+  .dbG{display:none}
+  .gRow{row-gap:4px}
+  .dbSvg{height:150px}
+}
+
+.limitBox{border:1px solid var(--line);border-radius:16px;padding:16px 18px;margin-bottom:16px}
+.limitTitle{font-weight:700;font-size:15px}
+.chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:4px}
+.chip{border:1px solid var(--line);background:var(--card);border-radius:12px;padding:8px 13px;
+  font-size:13.5px;cursor:pointer;color:var(--ink);display:inline-flex;flex-direction:column;
+  align-items:flex-start;gap:1px;font-family:var(--body);line-height:1.25}
+.chipOn{border-color:var(--save);background:#EAF6F1;color:#0B5C43;font-weight:600}
+.chipSub{font-size:11.5px;color:var(--dim);font-weight:400}
+.chipInput{flex-direction:row;align-items:center;gap:8px;cursor:default}
+.chipInput input{width:80px;padding:5px 8px}
+.conf{grid-column:1/-1;border:1px solid var(--line);border-radius:12px;padding:10px 14px 12px;margin:0;min-width:0}
+.conf legend{font-size:13px;font-weight:600;padding:0 6px}
+.confList{display:flex;flex-wrap:wrap;gap:6px 18px}
+.confList .check{grid-column:auto}
+.editNote{grid-column:1/-1;margin:0}
+.whenNote{color:#8A5A0B;font-size:12px;margin-top:3px;line-height:1.4}
+.cardNote{font-size:12px;margin-top:6px;line-height:1.4;color:#8A5A0B}
+.card-now .cardNote{color:#FDF0CF}
+.boardWarn{margin-top:14px;background:#FBEDE4;color:#6E2C0C;border-radius:12px;padding:10px 14px;
+  font-size:13.5px;line-height:1.5;display:grid;gap:4px}
+.addRow{display:flex;flex-wrap:wrap;align-items:center;gap:10px}
+.addRow select{width:auto;min-width:0;flex:0 1 220px}
+.addLbl{font-size:14px;font-weight:600}
+.applInfo,.applWhen{min-width:0}
+.applName,.applMeta,.whenTime,.whenCost,.whenNote,.whenBad{overflow-wrap:anywhere}
+
+@media (max-width:420px){
+  .colDni{display:none}
+  .tbl th,.tbl td{padding:8px 6px}
+  .tbl{font-size:13px}
+}
+
+.warnNote{color:#8A3D14;background:#FBEDE4;border-radius:10px;padding:8px 12px}
 `;
