@@ -12,9 +12,12 @@ import {
   buildIcs, hoursLabel, dni, dayCharacter, tier, PROFILY, VYCHOZI_PROFIL,
 } from '../src/logika.js';
 import { naHodiny, prahaDatum, vyberDen, zpracujEntsoe, prazskaPulnocUtc, dalsiDen, stahniCeny } from '../scripts/zdroje.mjs';
-import { buildFeedIcs, mesicniPrehled, csvHodiny, csvDny, SABLONY, novySpotrebic, doplnSpotrebice, prepniKonflikt, odeberSpotrebic } from '../src/logika.js';
+import { buildFeedIcs, mesicniPrehled, csvHodiny, csvDny, srovnaniSFixem, SABLONY, novySpotrebic, doplnSpotrebice, prepniKonflikt, odeberSpotrebic } from '../src/logika.js';
 import { PREMIUM_REZIM, PLATBA_URL, DODAVATELE } from '../src/nastaveni.js';
 import { FUNKCE, jePremium } from '../src/premium.js';
+import { zpravaNaDen, posliZpravu, nejlevnejsiOkno } from '../scripts/telegram.mjs';
+import { adresaWebu } from '../scripts/adresa.mjs';
+import { readFileSync, existsSync } from 'node:fs';
 
 let ok = 0, chyby = 0;
 const cekajici = [];
@@ -331,6 +334,18 @@ t('rozpis výroby z panelů po hodinách sedí s celkovým součtem', () => {
   assert.ok(p.pvPoHodinach[12] >= p.naHodinu * 0.5 && p.pvPoHodinach[13] < p.naHodinu * 0.5);
 });
 
+console.log('\nsrovnání s fixním tarifem:');
+t('drahý fix: spot vyjde levněji, kladný rozdíl', () => {
+  const b = backtest(historie, cfg, apps);
+  const sr = srovnaniSFixem(b, 9);
+  assert.ok(sr.rozdil > 0 && Math.abs(sr.fixMesicne - 9 * b.kwhPerMonth) < 1e-9);
+});
+t('levný fix: spot vyjde dráž, záporný rozdíl', () => assert.ok(srovnaniSFixem(backtest(historie, cfg, apps), 1).rozdil < 0));
+t('bez zadaného fixu žádné srovnání nevymýšlí', () => {
+  const b = backtest(historie, cfg, apps);
+  assert.strictEqual(srovnaniSFixem(b, null), null); assert.strictEqual(srovnaniSFixem(b, 0), null);
+});
+
 console.log('\núpravy seznamu spotřebičů:');
 t('zákaz souběhu se nastaví i zruší na obou stranách', () => {
   let l = [{ id: 'a', conflicts: [] }, { id: 'b', conflicts: [] }];
@@ -358,6 +373,47 @@ t('neplatné odkazy v zákazech se při načtení vyčistí', () => {
 });
 t('všechny šablony jsou fyzikálně možné (příkon ≥ spotřeba za hodinu)', () => {
   for (const [k, v] of Object.entries(SABLONY)) assert.ok(v.kw >= v.kwh / v.hours - 1e-9, k);
+});
+
+console.log('\nTelegram:');
+const zitraCeny = toFinalPrices(eur, cfg);
+t('nejlevnější okno 3 hodin', () => { const o = nejlevnejsiOkno(zitraCeny, 3); assert.strictEqual(o.od, 12); assert.strictEqual(o.do, 15); });
+t('zpráva má den v týdnu, okno, nejdražší hodinu a odkaz', () => {
+  const z = zpravaNaDen('2026-10-06', zitraCeny, { kind: 'normal' }, 'https://x.github.io/kdy-zapnout/');
+  assert.ok(z.includes('úterý 6. 10.') && z.includes('12:00–15:00') && z.includes('Nejdráž v 18:00') && z.includes('https://x.github.io'));
+});
+t('výjimečný den se ve zprávě zmíní', () =>
+  assert.ok(zpravaNaDen('2026-10-06', zitraCeny, { kind: 'big', today: 6.2, median: 3 }, '').includes('Výjimečně rozkolísaný')));
+t('bez nastavení se nic neposílá', async () => {
+  const r = await posliZpravu('x', { token: '', chat: '' });
+  assert.strictEqual(r.odeslano, false);
+});
+t('odeslání volá Telegram se správnými údaji', async () => {
+  let volano;
+  const r = await posliZpravu('ahoj', { token: 'T', chat: '@kanal', fetchFn: async (u, o) => { volano = { u, o }; return { ok: true, json: async () => ({ ok: true }) }; } });
+  assert.ok(r.odeslano && volano.u.endsWith('/botT/sendMessage'));
+  assert.deepStrictEqual(JSON.parse(volano.o.body).chat_id, '@kanal');
+});
+t('odmítnutí Telegramem je chyba s vysvětlením', async () => {
+  await assert.rejects(posliZpravu('x', { token: 'T', chat: 'c', fetchFn: async () => ({ ok: false, status: 400, json: async () => ({ ok: false, description: 'chat not found' }) }) }), /chat not found/);
+});
+
+console.log('\nadresa webu a instalace do telefonu:');
+t('adresa z repozitáře, vlastník malými písmeny', () =>
+  assert.strictEqual(adresaWebu({ GITHUB_REPOSITORY: 'Jakub/kdy-zapnout' }), 'https://jakub.github.io/kdy-zapnout/'));
+t('vlastní doména má přednost a dostane lomítko', () =>
+  assert.strictEqual(adresaWebu({ SITE_URL: 'https://kdyzapnout.cz', GITHUB_REPOSITORY: 'a/b' }), 'https://kdyzapnout.cz/'));
+t('repozitář jmeno.github.io leží na kořeni domény', () =>
+  assert.strictEqual(adresaWebu({ GITHUB_REPOSITORY: 'Jakub/jakub.github.io' }), 'https://jakub.github.io/'));
+t('lokálně bez proměnných prázdná adresa', () => assert.strictEqual(adresaWebu({}), ''));
+t('manifest aplikace je platný a ikony existují', () => {
+  const m = JSON.parse(readFileSync(new URL('../public/manifest.webmanifest', import.meta.url), 'utf8'));
+  assert.ok(m.name && m.start_url && m.display === 'standalone');
+  assert.ok(m.icons.some((i) => i.sizes === '512x512' && i.purpose === 'maskable'));
+  for (const i of m.icons) assert.ok(existsSync(new URL(`../public/${i.src}`, import.meta.url)), `chybí ${i.src}`);
+});
+t('obrázek pro sdílení a ikona pro iPhone existují', () => {
+  for (const f of ['og.png', 'apple-touch-icon.png', 'sw.js']) assert.ok(existsSync(new URL(`../public/${f}`, import.meta.url)), f);
 });
 
 await Promise.all(cekajici);

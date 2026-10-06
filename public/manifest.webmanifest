@@ -1,0 +1,16 @@
+{
+  "name": "Kdy zapnout",
+  "short_name": "Kdy zapnout",
+  "description": "Kdy dnes zapnout bojler, pračku a nabít auto, aby to vyšlo nejlevněji.",
+  "lang": "cs",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#F3F6F9",
+  "theme_color": "#121A2E",
+  "icons": [
+    { "src": "ikona-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "ikona-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "ikona-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

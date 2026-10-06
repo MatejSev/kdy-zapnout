@@ -43,6 +43,13 @@ export const FORMULAR_URL = "";
 export const GOATCOUNTER_KOD = "";
 
 /**
+ * Veřejný odkaz na telegramový kanál s denním plánem, třeba
+ * "https://t.me/kdyzapnout". Prázdné = odkaz se na stránce neukáže.
+ * Jak kanál založit a propojit, je v NAVOD.md (část C.5).
+ */
+export const TELEGRAM_URL = "";
+
+/**
  * Dodavatelé se spotovým tarifem a jejich přirážka ke spotu.
  *
  * Spotová cena je pro všechny stejná (z OTE). Dodavatelé se liší jen

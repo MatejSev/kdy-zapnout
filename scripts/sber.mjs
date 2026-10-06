@@ -13,7 +13,9 @@ import { readFile, writeFile, readdir, mkdir } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { prahaDatum, stahniCeny, stahniKurz, stahniSlunce } from './zdroje.mjs';
-import { toFinalPrices, buildFeedIcs, backtest, PROFILY } from '../src/logika.js';
+import { toFinalPrices, buildFeedIcs, backtest, dayCharacter, PROFILY } from '../src/logika.js';
+import { zpravaNaDen, posliZpravu } from './telegram.mjs';
+import { adresaWebu } from './adresa.mjs';
 import { SYSTEM_FEES } from '../src/tarify.js';
 
 const KOREN = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -117,6 +119,20 @@ export async function sestavKalendare(latest, dnes, zitra) {
   return vytvoreno;
 }
 
+/**
+ * Zpráva do Telegramu, když se v tomhle běhu poprvé stáhly zítřejší ceny.
+ * Selhání Telegramu nezastaví sběr ani web, jen se objeví jako varování.
+ */
+export async function oznamZitrek(latest, dnes, zitra, { token, chat, odkaz, fetchFn } = {}) {
+  const d = latest.days[zitra];
+  if (!d || !token || !chat) return { odeslano: false };
+  const prices = toFinalPrices(d.eur, { ...OBECNE_CFG, eurCzk: d.eurCzk });
+  const historie = Object.entries(latest.days).filter(([x]) => x < dnes).map(([date, v]) => ({ date, ...v }));
+  const spreads = backtest(historie, OBECNE_CFG, PROFILY.bojler.appliances).days;
+  const text = zpravaNaDen(zitra, prices, dayCharacter(prices, spreads), odkaz);
+  return posliZpravu(text, { token, chat, fetchFn });
+}
+
 // ── spuštění z příkazové řádky ───────────────────────────────
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const dnes = prahaDatum(0);
@@ -127,13 +143,26 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   try { await sberDne(dnes); dnesOk = true; }
   catch (e) { log(`  CHYBA ${e.message}`); }
 
-  try { await sberDne(zitra); }
+  let zitraNove = false;
+  try { const r = await sberDne(zitra); zitraNove = !r.preskoceno; }
   catch (e) { log(`  zítřek zatím není: ${e.message}`); }
 
   const latest = await sestavLatest();
   log(`latest.json: ${Object.keys(latest.days).length} dní`);
   const kal = await sestavKalendare(latest, dnes, zitra);
   log(`kalendáře k odběru: ${kal.join(', ')}`);
+
+  if (zitraNove && process.env.TELEGRAM_TOKEN && process.env.TELEGRAM_CHAT) {
+    try {
+      await oznamZitrek(latest, dnes, zitra, {
+        token: process.env.TELEGRAM_TOKEN, chat: process.env.TELEGRAM_CHAT, odkaz: adresaWebu(),
+      });
+      log('Telegram: zpráva odeslána');
+    } catch (e) {
+      // GitHub to zobrazí jako žluté varování u běhu
+      console.log(`::warning::Telegram: ${e.message}`);
+    }
+  }
 
   if (!dnesOk && !latest.days[dnes]) {
     console.error(`\nNepodařilo se získat ceny na dnešek (${dnes}). Stránka ukazuje starší data.`);

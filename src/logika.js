@@ -325,11 +325,24 @@ export function backtest(days, cfg, appliances) {
     savedVsAverage: sum("savedVsAverage"),
     totalOptimized: sum("optimized"),
     totalAtAverage: sum("atAverage"),
+    totalKwh: sum("kwh"),
     perDay: n ? sum("savedVsAverage") / n : 0,
     perMonth: n ? (sum("savedVsAverage") / n) * 30 : 0,
+    spotPerMonth: n ? (sum("optimized") / n) * 30 : 0,
+    kwhPerMonth: n ? (sum("kwh") / n) * 30 : 0,
     projectedYear: n ? (sum("savedVsAverage") / n) * 365 : 0,
     reliable: n >= 14,
   };
+}
+
+/**
+ * Srovnání s fixním tarifem uživatele. Počítá jen spotřebiče v plánu,
+ * ne celý dům — to musí UI říct nahlas. Kladný rozdíl = spot je levnější.
+ */
+export function srovnaniSFixem(bt, fixKcKwh) {
+  if (!Number.isFinite(fixKcKwh) || fixKcKwh <= 0 || !bt?.dayCount) return null;
+  const fixMesicne = fixKcKwh * bt.kwhPerMonth;
+  return { fixMesicne, spotMesicne: bt.spotPerMonth, rozdil: fixMesicne - bt.spotPerMonth, kwh: bt.kwhPerMonth };
 }
 
 // ═══ Předvolby domácností ══════════════════════════════════════

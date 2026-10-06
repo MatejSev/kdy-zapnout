@@ -5,11 +5,11 @@ import {
 import {
   toFinalPrices, optimize, actionFor, odpocet, dayCharacter, buildIcs, isoDay,
   cheapestWindow, oknoPopis, tier, hoursLabel, pad, dni, czDate, backtest,
-  PROFILY, VYCHOZI_PROFIL, mesicniPrehled, csvHodiny, csvDny,
+  PROFILY, VYCHOZI_PROFIL, mesicniPrehled, csvHodiny, csvDny, srovnaniSFixem,
   SABLONY, novySpotrebic, doplnSpotrebice, prepniKonflikt, odeberSpotrebic,
 } from "./logika.js";
 import {
-  PREMIUM_CENA, PLATBA_URL, FORMULAR_URL, GOATCOUNTER_KOD, DODAVATELE,
+  PREMIUM_CENA, PLATBA_URL, FORMULAR_URL, GOATCOUNTER_KOD, DODAVATELE, TELEGRAM_URL,
 } from "./nastaveni.js";
 import { FUNKCE, jePremium, jeZdarmaRezim } from "./premium.js";
 
@@ -109,6 +109,21 @@ export default function App() {
     } catch { /* poškozené, jedeme na výchozím */ }
   }, []);
   const uloz = (p, c, a) => store.set(KLIC, JSON.stringify({ profil: p, cfg: c, appliances: a }));
+
+  // Nabídka "přidat na plochu" (Android a Chrome). iPhone ji neumí,
+  // tam postup vysvětlují Časté otázky.
+  const [instalace, setInstalace] = useState(null);
+  useEffect(() => {
+    const h = (e) => { e.preventDefault(); setInstalace(e); };
+    window.addEventListener("beforeinstallprompt", h);
+    return () => window.removeEventListener("beforeinstallprompt", h);
+  }, []);
+  const nainstaluj = async () => {
+    if (!instalace) return;
+    instalace.prompt();
+    try { await instalace.userChoice; } catch { /* nevadí */ }
+    setInstalace(null);
+  };
 
   // Měření návštěvnosti, jen když je v nastaveni.js vyplněný kód.
   useEffect(() => {
@@ -221,6 +236,7 @@ export default function App() {
             day={day} setDay={setDay} hasTomorrow={Boolean(tomorrowPrices)}
             tomorrowMsg={tomorrowPrices ? null : "Zítřejší ceny zveřejňuje OTE odpoledne, stránka je načte sama."}
             character={dayCharacter(prices, bt.days)} onIcs={() => stahnoutIcs(opt.plan, shownDate)}
+            onInstall={instalace ? nainstaluj : null}
             window={cheapestWindow(todayPrices, tomorrowPrices, now.getHours(), 3)} />
 
           <section className="hero">
@@ -279,6 +295,8 @@ export default function App() {
         {tab === "premium" && <Premium bt={bt} />}
       </main>
 
+      <Otazky />
+
       <footer className="foot">
         <p>
           Úspory jsou modelové, ne zaručené: počítají se ze skutečných cen, ale z typické
@@ -322,6 +340,79 @@ function popisNelze(p) {
   return casti.length
     ? `V povoleném čase se nevejde kvůli ${vycet(casti)}. Zkus mu rozšířit časové okno.`
     : "V povoleném čase se nevejde. Zkus mu rozšířit časové okno.";
+}
+
+// ═══ Časté otázky ══════════════════════════════════════════════
+function Otazky() {
+  const Q = ({ q, children }) => (
+    <details className="qa">
+      <summary>{q}</summary>
+      <div className="qaA">{children}</div>
+    </details>
+  );
+  return (
+    <section className="sec faq">
+      <h2 className="secHead">Časté otázky</h2>
+      <Q q="Co je spotový tarif a komu se vyplatí?">
+        <p>
+          U spotového tarifu platíš za elektřinu cenu, která se mění každou hodinu podle
+          denního trhu. V noci a přes poledne bývá levná, ráno a večer drahá. Vyplatí se hlavně
+          tomu, kdo může velkou spotřebu přesouvat — bojler, nabíjení auta, tepelné čerpadlo.
+          Kdo spotřebu přesouvat nemůže, nese riziko drahých hodin.
+        </p>
+      </Q>
+      <Q q="Odkud jsou ceny a dají se jim věřit?">
+        <p>
+          Spotové ceny jsou z denního trhu OTE, kurz eura z ČNB a distribuce z ceníků
+          distributorů pro rok 2026. K tomu se přičítají systémové poplatky a DPH. Spotová cena
+          je u všech dodavatelů stejná; liší se jen jejich přirážka, kterou si nastavíš v Můj tarif.
+        </p>
+      </Q>
+      <Q q="Proč se plán každý den mění?">
+        <p>
+          Protože se mění ceny. Ceny na zítřek zveřejňuje OTE kolem druhé odpoledne a stránka si
+          je stáhne sama. Většinou bývá nejlevněji kolem poledne, ale některé dny jsou výrazně
+          jiné — na ty tě stránka upozorní.
+        </p>
+      </Q>
+      <Q q="Je úspora zaručená?">
+        <p>
+          Není. Čísla počítají se skutečnými cenami, ale s typickou spotřebou spotřebičů a
+          s tím, že plán dodržíš. Skutečná úspora záleží na tvých spotřebičích, tarifu a smlouvě.
+        </p>
+      </Q>
+      <Q q="Musím něco nastavovat?">
+        <p>
+          Ne. Stránka počítá s nejrozšířenějším tarifem D02d a spotřebiči podle typu domácnosti,
+          který vybereš nahoře. Pro přesnější čísla si dole nastav distributora, sazbu, dodavatele
+          a své spotřebiče. Nastavení se pamatuje v tvém prohlížeči.
+        </p>
+      </Q>
+      <Q q="Padají mi pojistky, když běží víc spotřebičů najednou. Co s tím?">
+        <p>
+          V záložce Spotřebiče nastav limit příkonu domu, nebo u konkrétních spotřebičů zakaž,
+          aby běžely současně. Plán je pak rozloží tak, aby se nesešly, a napíše, kolik to stojí navíc.
+        </p>
+      </Q>
+      <Q q="Jak dostanu připomínky do telefonu?">
+        <p>
+          Nejpohodlnější je kalendář k odběru: přidáš si ho jednou a plán se v něm každý den
+          objeví sám. Na jeden den stačí tlačítko Přidat do kalendáře.
+          {TELEGRAM_URL && <> Denní plán posíláme i do <a href={TELEGRAM_URL} target="_blank" rel="noopener">kanálu na Telegramu</a>.</>}
+        </p>
+        <p>
+          Stránku si můžeš dát na plochu jako aplikaci. Na Androidu v Chromu přes nabídku
+          Přidat na plochu, na iPhonu v Safari přes tlačítko Sdílet a Přidat na plochu.
+        </p>
+      </Q>
+      <Q q="Co se děje s mými údaji?">
+        <p>
+          Nic se nikam neodesílá. Nastavení zůstává jen v tvém prohlížeči a nemáš tu žádný účet.
+          {GOATCOUNTER_KOD && " Měříme jen anonymní návštěvnost, bez cookies a bez osobních údajů."}
+        </p>
+      </Q>
+    </section>
+  );
 }
 
 // ═══ Hlavička se stavem dat ════════════════════════════════════
@@ -389,6 +480,18 @@ function UsporyHero({ bt, btProfily, profil, vyberProfil, showMethod, setShowMet
             </div>
             <ProofBars days={bt.days} />
           </div>
+          {(() => {
+            const sr = srovnaniSFixem(bt, cfg.flatPrice);
+            if (!sr) return null;
+            return (
+              <p className={sr.rozdil >= 0 ? "fixCmp" : "fixCmp fixHorsi"}>
+                Proti tvému fixnímu tarifu {fmt(cfg.flatPrice)} Kč za kWh by spotřebiče v plánu
+                na spotu stály <strong>o {fmtCzk(Math.abs(sr.rozdil))} měsíčně {sr.rozdil >= 0 ? "méně" : "víc"}</strong>
+                {" "}({fmtCzk(sr.spotMesicne)} místo {fmtCzk(sr.fixMesicne)} za {fmt(sr.kwh, 0)} kWh).
+                {" "}Zbytek spotřeby domu v tom není.
+              </p>
+            );
+          })()}
           <p className="projection">
             Za {dni(bt.dayCount)} od {czDate(bt.from)} do {czDate(bt.to)}: {fmt(bt.totalAtAverage, 0)} Kč
             při spouštění kdykoli, {fmt(bt.totalOptimized, 0)} Kč podle plánu.
@@ -463,7 +566,7 @@ function HourMap({ prices, plan, showNow }) {
 }
 
 // ═══ Tabule: co zapnout teď ════════════════════════════════════
-function ActionBoard({ plan, prices, avg, now, isToday, day, setDay, hasTomorrow, tomorrowMsg, character, onIcs, window: okno }) {
+function ActionBoard({ plan, prices, avg, now, isToday, day, setDay, hasTomorrow, tomorrowMsg, character, onIcs, onInstall, window: okno }) {
   const nowH = now.getHours(), nowM = now.getMinutes();
   const cur = prices[nowH];
   const levne = cur && cur.price <= avg * 0.9;
@@ -568,6 +671,8 @@ function ActionBoard({ plan, prices, avg, now, isToday, day, setDay, hasTomorrow
       {polozky.length > 0 && (
         <div className="boardFoot">
           <button className="btn btnSolid" onClick={onIcs}>Přidat do kalendáře</button>
+          {onInstall && <button className="btn" onClick={onInstall}>Přidat na plochu telefonu</button>}
+          {TELEGRAM_URL && <a className="btn" href={TELEGRAM_URL} target="_blank" rel="noopener">Denní plán na Telegramu</a>}
           <p className="boardFootNote">
             Telefon ti pět minut předem připomene, co zapnout.
           </p>
@@ -907,11 +1012,15 @@ function PriceTab({ cfg, update, prices, eurCzk }) {
         {eurCzk && <p className="fieldNote">Kurz eura dnes {fmt(eurCzk, 3)} Kč podle ČNB, bere se automaticky.</p>}
         <Field label="Systémové poplatky v Kč za kWh"><input type="number" step="0.01" value={cfg.systemFees}
           onChange={(e) => update({ systemFees: +e.target.value })} /></Field>
-        <Field label="Tvůj fixní tarif v Kč za kWh s DPH, nepovinné">
+        <Field label="Tvůj současný fixní tarif v Kč za kWh, nepovinné">
           <input type="number" step="0.01" min="0" placeholder="z vyúčtování, když chceš srovnání"
             value={cfg.flatPrice ?? ""}
             onChange={(e) => update({ flatPrice: e.target.value === "" ? null : +e.target.value })} />
         </Field>
+        <p className="fieldNote">
+          Najdeš ho na vyúčtování jako cenu za kWh včetně distribuce a DPH. Nahoře u úspor
+          se pak ukáže, jestli by ti spot vyšel levněji.
+        </p>
       </div>
 
       <div>
@@ -1573,4 +1682,19 @@ input:focus,select:focus{border-color:var(--save)}
 }
 
 .warnNote{color:#8A3D14;background:#FBEDE4;border-radius:10px;padding:8px 12px}
+
+.fixCmp{margin-top:16px;background:rgba(110,231,183,.12);border:1px solid rgba(110,231,183,.3);
+  color:#D9F5E8;border-radius:12px;padding:12px 15px;font-size:14px;line-height:1.55;max-width:68ch}
+.fixCmp strong{color:#fff}
+.fixHorsi{background:rgba(240,180,41,.12);border-color:rgba(240,180,41,.35);color:#FBEBC3}
+
+.faq .qa{border-top:1px solid var(--line)}
+.faq .qa:last-child{border-bottom:1px solid var(--line)}
+.faq summary{cursor:pointer;padding:14px 28px 14px 0;font-weight:600;font-size:15px;list-style:none;position:relative;line-height:1.4}
+.faq summary::-webkit-details-marker{display:none}
+.faq summary::after{content:"+";position:absolute;right:4px;top:12px;font-size:20px;color:var(--dim);font-weight:400}
+.faq details[open] summary::after{content:"–"}
+.qaA{padding:0 0 14px;color:var(--dim);font-size:14.5px;line-height:1.6;max-width:70ch;display:grid;gap:8px}
+.qaA a{color:var(--save)}
+.boardFoot .btn{text-decoration:none;display:inline-flex;align-items:center}
 `;
