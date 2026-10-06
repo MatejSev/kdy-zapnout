@@ -5,6 +5,10 @@
 # Při změně:  totéž, když nahraješ nový kód
 # Při chybě:  GitHub ti pošle e-mail, web běží dál s posledními daty
 #
+# Když selže krok "nasazeni" s hláškou "not acquired by Runner" nebo
+# "Internal server error", je to výpadek na straně GitHubu, ne chyba
+# v kódu. Další plánovaný běh to nasadí sám, nebo klikni Re-run jobs.
+#
 # Časy jsou v UTC (GitHub jinak neumí):
 #   12:40 UTC = 14:40 letní čas / 13:40 zimní čas
 #   16:10 UTC = 18:10 letní čas / 17:10 zimní čas (druhý pokus)
@@ -31,14 +35,16 @@ concurrency:
 jobs:
   sestaveni:
     runs-on: ubuntu-latest
+    # bez limitu by zaseknutý běh čekal až 6 hodin a blokoval další
+    timeout-minutes: 15
     outputs:
       sber: ${{ steps.sber.outcome }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
 
       - run: npm ci
@@ -56,6 +62,10 @@ jobs:
         env:
           # nepovinné: záložní zdroj ENTSO-E, když OTE selže (viz NAVOD.md)
           ENTSOE_TOKEN: ${{ secrets.ENTSOE_TOKEN }}
+          # nepovinné: denní plán do telegramového kanálu (viz NAVOD.md)
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT: ${{ secrets.TELEGRAM_CHAT }}
+          SITE_URL: ${{ vars.SITE_URL }}
         run: npm run sber
 
       - name: Uložení nasbíraných dat
@@ -72,21 +82,25 @@ jobs:
           fi
 
       - name: Sestavení webu
+        env:
+          # vlastní doména pro náhled při sdílení; prázdné = odvodí se z GitHubu
+          SITE_URL: ${{ vars.SITE_URL }}
         run: npm run build
 
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: dist
 
   nasazeni:
     needs: sestaveni
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     environment:
       name: github-pages
       url: ${{ steps.nasazeni.outputs.page_url }}
     steps:
       - id: nasazeni
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
 
       - name: Hlášení, že sběr selhal
         if: needs.sestaveni.outputs.sber != 'success'
@@ -97,10 +111,11 @@ jobs:
   # Po Novém roce připomene, že je potřeba aktualizovat ceny distribuce.
   kontrola-cen:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 24
       - name: Jsou ceny distribuce pro letošní rok?
         run: npm run kontrola
