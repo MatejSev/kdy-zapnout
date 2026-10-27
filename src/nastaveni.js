@@ -40,7 +40,7 @@ export const FORMULAR_URL = "";
  * třeba "kdyzapnout" z adresy kdyzapnout.goatcounter.com.
  * Prázdné = nic se neměří.
  */
-export const GOATCOUNTER_KOD = "";
+export const GOATCOUNTER_KOD = "matej-s";
 
 /**
  * Veřejný odkaz na telegramový kanál s denním plánem, třeba
