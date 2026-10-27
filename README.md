@@ -2,8 +2,6 @@
 
 Plánovač spotřeby podle spotové ceny elektřiny. Ukazuje, kdy zapnout bojler, pračku nebo nabít auto, aby to vyšlo co nejlevněji, a kolik to ušetří.
 
-**Jak to spustit: [NAVOD.md](NAVOD.md).**
-
 ## Jak to funguje
 
 Stránka nemá vlastní server. GitHub Actions každý den stáhne ceny z OTE, kurz z ČNB a předpověď slunce z Open-Meteo, uloží je do `public/data/` a přestaví web na GitHub Pages.
