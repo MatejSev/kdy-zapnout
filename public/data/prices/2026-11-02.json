@@ -1,0 +1,128 @@
+{
+ "date": "2026-11-02",
+ "collectedAt": "2026-11-01T18:05:35.642Z",
+ "eurCzk": 24.36,
+ "source": "OTE",
+ "hours": [
+  {
+   "hour": 0,
+   "eurMwh": 243,
+   "radiation": 0
+  },
+  {
+   "hour": 1,
+   "eurMwh": 237.19,
+   "radiation": 0
+  },
+  {
+   "hour": 2,
+   "eurMwh": 231.92,
+   "radiation": 0
+  },
+  {
+   "hour": 3,
+   "eurMwh": 231.54,
+   "radiation": 0
+  },
+  {
+   "hour": 4,
+   "eurMwh": 232.42,
+   "radiation": 0
+  },
+  {
+   "hour": 5,
+   "eurMwh": 242.65,
+   "radiation": 0
+  },
+  {
+   "hour": 6,
+   "eurMwh": 305.23,
+   "radiation": 0
+  },
+  {
+   "hour": 7,
+   "eurMwh": 339.85,
+   "radiation": 0
+  },
+  {
+   "hour": 8,
+   "eurMwh": 336.54,
+   "radiation": 0.02
+  },
+  {
+   "hour": 9,
+   "eurMwh": 317.09,
+   "radiation": 0.06
+  },
+  {
+   "hour": 10,
+   "eurMwh": 284.95,
+   "radiation": 0.1
+  },
+  {
+   "hour": 11,
+   "eurMwh": 293.07,
+   "radiation": 0.13
+  },
+  {
+   "hour": 12,
+   "eurMwh": 300.41,
+   "radiation": 0.14
+  },
+  {
+   "hour": 13,
+   "eurMwh": 330.85,
+   "radiation": 0.14
+  },
+  {
+   "hour": 14,
+   "eurMwh": 354.01,
+   "radiation": 0.11
+  },
+  {
+   "hour": 15,
+   "eurMwh": 363.15,
+   "radiation": 0.06
+  },
+  {
+   "hour": 16,
+   "eurMwh": 351.02,
+   "radiation": 0.04
+  },
+  {
+   "hour": 17,
+   "eurMwh": 353.28,
+   "radiation": 0
+  },
+  {
+   "hour": 18,
+   "eurMwh": 346.78,
+   "radiation": 0
+  },
+  {
+   "hour": 19,
+   "eurMwh": 353.34,
+   "radiation": 0
+  },
+  {
+   "hour": 20,
+   "eurMwh": 337.28,
+   "radiation": 0
+  },
+  {
+   "hour": 21,
+   "eurMwh": 290.78,
+   "radiation": 0
+  },
+  {
+   "hour": 22,
+   "eurMwh": 245.86,
+   "radiation": 0
+  },
+  {
+   "hour": 23,
+   "eurMwh": 232.72,
+   "radiation": 0
+  }
+ ]
+}
