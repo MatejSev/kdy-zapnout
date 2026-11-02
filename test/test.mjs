@@ -12,7 +12,7 @@ import {
   buildIcs, hoursLabel, dni, dayCharacter, tier, PROFILY, VYCHOZI_PROFIL,
 } from '../src/logika.js';
 import { naHodiny, prahaDatum, vyberDen, zpracujEntsoe, prazskaPulnocUtc, dalsiDen, stahniCeny } from '../scripts/zdroje.mjs';
-import { buildFeedIcs, mesicniPrehled, csvHodiny, csvDny, srovnaniSFixem, SABLONY, novySpotrebic, doplnSpotrebice, prepniKonflikt, odeberSpotrebic } from '../src/logika.js';
+import { buildFeedIcs, mesicniPrehled, csvHodiny, csvDny, srovnaniSFixem, zakodujNastaveni, dekodujNastaveni, vHodin, pocetSpotrebicu, SABLONY, novySpotrebic, doplnSpotrebice, prepniKonflikt, odeberSpotrebic } from '../src/logika.js';
 import { PREMIUM_REZIM, PLATBA_URL, DODAVATELE } from '../src/nastaveni.js';
 import { FUNKCE, jePremium } from '../src/premium.js';
 import { zpravaNaDen, posliZpravu, nejlevnejsiOkno } from '../scripts/telegram.mjs';
@@ -414,6 +414,50 @@ t('manifest aplikace je platný a ikony existují', () => {
 });
 t('obrázek pro sdílení a ikona pro iPhone existují', () => {
   for (const f of ['og.png', 'apple-touch-icon.png', 'sw.js']) assert.ok(existsSync(new URL(`../public/${f}`, import.meta.url)), f);
+});
+
+console.log('\npřenos nastavení odkazem:');
+const vzor = {
+  profil: 'vlastni',
+  cfg: { distributor: 'PRE', rate: 'D25d', margin: 0.35, kwp: 5, feedIn: 0.6, flatPrice: 7.5, baseLoadPerHour: 0.3, ntHours: [0, 1, 2, 13], dodavatel: 'vlastni', maxKw: 3.5 },
+  appliances: [
+    { id: 'pracka', name: 'Pračka v koupelně', kwh: 1.2, hours: 2, kw: 2, contiguous: true, earliest: 6, latest: 22, priority: 30, enabled: true, conflicts: ['susicka'] },
+    { id: 'susicka', name: 'Sušička', kwh: 2.5, hours: 2, kw: 2.5, contiguous: true, earliest: 6, latest: 22, priority: 35, enabled: false, conflicts: ['pracka'] },
+  ],
+};
+t('nastavení projde odkazem tam a zpět beze ztráty (i s diakritikou)', () => {
+  const z = zakodujNastaveni(vzor);
+  assert.ok(/^[A-Za-z0-9_-]+$/.test(z), 'v odkazu jsou nepovolené znaky');
+  assert.deepStrictEqual(dekodujNastaveni(z), vzor);
+});
+t('odkaz je dost krátký na QR kód', () => assert.ok(zakodujNastaveni(vzor).length < 600, `${zakodujNastaveni(vzor).length} znaků`));
+t('poškozený odkaz je srozumitelná chyba', () => assert.throws(() => dekodujNastaveni('nesmysl!!'), /poškozený/));
+t('podvržené hodnoty se omezí na rozumné meze', () => {
+  const zly = btoa(JSON.stringify([1, 'x', ['XXX', 'ZZZ', 999, -5, 1, 1e9, 1, [99, -1, 3], 'a', 0.01],
+    [['a b<script>', 'x'.repeat(500), -1, 99, 0, 1, -3, 99, 0, 1, ['neni', 'a b<script>']]]])).replace(/=+$/, '');
+  const d = dekodujNastaveni(zly);
+  assert.strictEqual(d.cfg.distributor, 'CEZ'); assert.strictEqual(d.cfg.rate, 'D02d');
+  assert.strictEqual(d.cfg.margin, 5); assert.strictEqual(d.cfg.kwp, 0); assert.deepStrictEqual(d.cfg.ntHours, [3]);
+  assert.strictEqual(d.cfg.maxKw, 0.5);
+  const s = d.appliances[0];
+  assert.strictEqual(s.id, 'abscript'); assert.strictEqual(s.name.length, 60); assert.strictEqual(s.hours, 24);
+  assert.deepStrictEqual(s.conflicts, []);
+});
+t('nejvýš 20 spotřebičů, i když jich odkaz nese víc', () => {
+  const mnoho = { ...vzor, appliances: Array.from({ length: 40 }, (_, i) => ({ ...vzor.appliances[0], id: `s${i}`, conflicts: [] })) };
+  assert.strictEqual(dekodujNastaveni(zakodujNastaveni(mnoho)).appliances.length, 20);
+});
+
+console.log('\nčeština:');
+t('v 9:00, ale ve 12:00 a ve 20:00', () => {
+  assert.deepStrictEqual([0, 1, 2, 5, 9, 12, 13, 15, 19, 20, 23].map(vHodin),
+    ['v', 'v', 've', 'v', 'v', 've', 've', 'v', 'v', 've', 've']);
+});
+t('1 spotřebič, 3 spotřebiče, 5 spotřebičů', () =>
+  assert.deepStrictEqual([1, 3, 5].map(pocetSpotrebicu), ['1 spotřebič', '3 spotřebiče', '5 spotřebičů']));
+t('Telegram: "ve 20:00" u večerní špičky', () => {
+  const c = toFinalPrices(Array.from({ length: 24 }, (_, h) => (h === 20 ? 300 : 100)), cfg);
+  assert.ok(zpravaNaDen('2026-10-06', c, { kind: 'normal' }, '').includes('Nejdráž ve 20:00'));
 });
 
 await Promise.all(cekajici);

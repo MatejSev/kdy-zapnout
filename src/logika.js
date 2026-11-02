@@ -546,3 +546,93 @@ export function csvDny(btDny) {
   for (const d of btDny) radky.push([d.date, cz(d.kwh, 1), cz(d.optimized, 2), cz(d.atAverage, 2), cz(d.savedVsAverage, 2), cz(d.spread, 2)]);
   return "\uFEFF" + radky.map((r) => r.map(csvEsc).join(";")).join("\r\n");
 }
+
+// ═══ Přenos nastavení odkazem (náhrada za registraci) ══════════
+// Nastavení se zabalí do odkazu, který si člověk otevře v telefonu.
+// Žádný účet, žádný server, nic se nikam neodesílá. Odkaz může přijít
+// od kohokoli, proto se při čtení každá hodnota ověří a omezí.
+
+const b64url = {
+  zakoduj(text) {
+    const bajty = new TextEncoder().encode(text);
+    let bin = "";
+    for (const b of bajty) bin += String.fromCharCode(b);
+    return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  },
+  dekoduj(s) {
+    const bin = atob(s.replace(/-/g, "+").replace(/_/g, "/"));
+    return new TextDecoder().decode(Uint8Array.from(bin, (c) => c.charCodeAt(0)));
+  },
+};
+
+export function zakodujNastaveni({ profil, cfg, appliances }) {
+  const c = [cfg.distributor, cfg.rate, cfg.margin, cfg.kwp, cfg.feedIn, cfg.flatPrice,
+    cfg.baseLoadPerHour, cfg.ntHours, cfg.dodavatel, cfg.maxKw];
+  const a = appliances.map((x) => [x.id, x.name, x.kwh, x.hours, x.kw, x.contiguous ? 1 : 0,
+    x.earliest, x.latest, x.priority, x.enabled ? 1 : 0, x.conflicts ?? []]);
+  return b64url.zakoduj(JSON.stringify([1, profil, c, a]));
+}
+
+const cislo = (v, min, max, vychozi) => (Number.isFinite(v) ? Math.min(max, Math.max(min, v)) : vychozi);
+const nebo = (v, nul) => (v === null || v === undefined ? nul : v);
+
+/** Vrátí ověřené nastavení, nebo vyhodí chybu, když odkaz není platný. */
+export function dekodujNastaveni(text) {
+  let d;
+  try { d = JSON.parse(b64url.dekoduj(String(text))); } catch { throw new Error("Odkaz s nastavením je poškozený."); }
+  if (!Array.isArray(d) || d[0] !== 1 || !Array.isArray(d[2]) || !Array.isArray(d[3])) {
+    throw new Error("Odkaz s nastavením je poškozený.");
+  }
+  const [, profil, c, a] = d;
+  const distributor = typeof c[0] === "string" && DISTRIBUTORS[c[0]] ? c[0] : "CEZ";
+  const rate = typeof c[1] === "string" && DISTRIBUTORS[distributor].rates[c[1]] ? c[1] : "D02d";
+  const ntHours = Array.isArray(c[7])
+    ? [...new Set(c[7].filter((h) => Number.isInteger(h) && h >= 0 && h < 24))].sort((x, y) => x - y)
+    : null;
+  const cfg = {
+    distributor, rate,
+    margin: cislo(c[2], 0, 5, 0),
+    kwp: cislo(c[3], 0, 100, 0),
+    feedIn: cislo(c[4], 0, 10, 0.6),
+    flatPrice: c[5] == null ? null : cislo(c[5], 0, 50, null),
+    baseLoadPerHour: cislo(c[6], 0, 10, 0.3),
+    ntHours: c[7] == null ? null : ntHours,
+    dodavatel: typeof c[8] === "string" ? c[8].slice(0, 40) : "spot",
+    maxKw: c[9] == null ? null : cislo(c[9], 0.5, 100, null),
+  };
+  const ids = new Set();
+  const appliances = a.slice(0, 20).map((x) => {
+    let id = String(nebo(x[0], "s")).replace(/[^a-z0-9_-]/gi, "").slice(0, 30) || "s";
+    while (ids.has(id)) id += "x";
+    ids.add(id);
+    return {
+      id,
+      name: String(nebo(x[1], "Spotřebič")).slice(0, 60),
+      kwh: cislo(x[2], 0.1, 200, 1),
+      hours: Math.round(cislo(x[3], 1, 24, 1)),
+      kw: cislo(x[4], 0.1, 50, 2),
+      contiguous: x[5] === 1,
+      earliest: Math.round(cislo(x[6], 0, 23, 0)),
+      latest: Math.round(cislo(x[7], 1, 24, 24)),
+      priority: Math.round(cislo(x[8], 1, 99, 50)),
+      enabled: x[9] !== 0,
+      conflicts: Array.isArray(x[10]) ? x[10].map((v) => String(v).slice(0, 30)) : [],
+    };
+  });
+  // zákazy jen mezi spotřebiči, které v odkazu opravdu jsou
+  for (const x of appliances) x.conflicts = x.conflicts.filter((v) => ids.has(v) && v !== x.id);
+  return { profil: typeof profil === "string" ? profil.slice(0, 20) : "vlastni", cfg, appliances };
+}
+
+/**
+ * "v 9:00", ale "ve 12:00": "ve" se píše před hodinami, které se
+ * vyslovují se skupinou souhlásek na začátku (dvě, tři, čtyři,
+ * dvanáct, třináct, čtrnáct, dvacet…).
+ */
+export function vHodin(h) {
+  const n = ((h % 24) + 24) % 24;
+  return [2, 3, 4, 12, 13, 14, 20, 21, 22, 23].includes(n) ? "ve" : "v";
+}
+
+/** Česká množná čísla: 1 spotřebič, 2–4 spotřebiče, 5+ spotřebičů. */
+export const pocetSpotrebicu = (n) => `${n} ${n === 1 ? "spotřebič" : n >= 2 && n <= 4 ? "spotřebiče" : "spotřebičů"}`;

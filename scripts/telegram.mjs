@@ -6,6 +6,8 @@
 // Posílá se jednou denně, když se poprvé stáhnou zítřejší ceny.
 // ───────────────────────────────────────────────────────────────
 
+import { vHodin } from '../src/logika.js';
+
 const DNY = ['neděle', 'pondělí', 'úterý', 'středa', 'čtvrtek', 'pátek', 'sobota'];
 const kc = (n) => n.toFixed(2).replace('.', ',');
 
@@ -37,7 +39,7 @@ export function zpravaNaDen(datum, prices, charakter, odkaz) {
     `⚡ Zítra, ${den} ${d}. ${m}.`,
     '',
     `Nejlevněji ${cas(okno.od)}–${cas(okno.do)}, v průměru ${kc(okno.prum)} Kč/kWh.`,
-    `Nejdráž v ${cas(maxH)}, ${kc(ceny[maxH])} Kč/kWh.`,
+    `Nejdráž ${vHodin(maxH)} ${cas(maxH)}, ${kc(ceny[maxH])} Kč/kWh.`,
   ];
   if (charakter?.kind === 'big') {
     radky.push('', `Výjimečně rozkolísaný den: rozdíl ${charakter.today.toFixed(1).replace('.', ',')}×, obvykle ${charakter.median.toFixed(1).replace('.', ',')}×. Plán se vyplatí dodržet víc než jindy.`);

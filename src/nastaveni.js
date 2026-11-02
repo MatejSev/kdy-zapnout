@@ -18,6 +18,12 @@
  */
 export const PREMIUM_REZIM = "zdarma";
 
+/**
+ * Označení "Zkušební verze" v hlavičce. Ve fázi testování ho nech
+ * zapnuté: lidé jsou shovívavější a ochotněji napíšou, co jim chybí.
+ */
+export const ZKUSEBNI_VERZE = true;
+
 /** Cena předplatného, jen pro zobrazení. */
 export const PREMIUM_CENA = 149;
 
@@ -40,7 +46,7 @@ export const FORMULAR_URL = "";
  * třeba "kdyzapnout" z adresy kdyzapnout.goatcounter.com.
  * Prázdné = nic se neměří.
  */
-export const GOATCOUNTER_KOD = "matej-s";
+export const GOATCOUNTER_KOD = "";
 
 /**
  * Veřejný odkaz na telegramový kanál s denním plánem, třeba
