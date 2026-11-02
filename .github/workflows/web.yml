@@ -47,7 +47,7 @@ jobs:
           node-version: 24
           cache: npm
 
-      - run: npm ci
+      - run: npm install
 
       # Když testy neprojdou, dál se nepokračuje a na webu zůstane
       # poslední funkční verze.
