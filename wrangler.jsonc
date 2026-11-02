@@ -1,0 +1,9 @@
+// Nastavení pro Cloudflare: web je hotová statická stránka ve složce dist.
+// Díky tomuhle souboru se Cloudflare nesnaží projekt nastavovat sám.
+{
+  "name": "kdyzapnout",
+  "compatibility_date": "2026-10-01",
+  "assets": {
+    "directory": "./dist"
+  }
+}

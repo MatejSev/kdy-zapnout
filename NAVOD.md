@@ -61,6 +61,8 @@ Zdarma, bez tvého jména, a na rozdíl od GitHub Pages **povoluje i placenou sl
 7. **Save and Deploy**. Za pár minut web poběží na nové adrese.
 8. Na GitHubu nastav stejnou adresu i pro automatizaci, aby na ni odkazovaly zprávy do Telegramu: **Settings** → **Secrets and variables** → **Actions** → záložka **Variables** → **New repository variable** → Name `SITE_URL`, Value `https://kdyzapnout.pages.dev/`.
 
+**Když Cloudflare založí projekt jako „Worker"** (v nastavení je pak i *Deploy command* `npx wrangler deploy`), postará se o nasazení soubor `wrangler.jsonc` v repozitáři — stačí, aby tam byl. Adresa pak bude `kdyzapnout.NĚCO.workers.dev`, kde „NĚCO" je subdoména tvého účtu. Když obsahuje tvoje jméno, změň ji v nastavení účtu u Workers & Pages na něco neutrálního. Do `SITE_URL` (v Cloudflaru i na GitHubu) pak napiš tuhle adresu.
+
 `npm test` v kroku 5 je pojistka: když testy neprojdou, Cloudflare novou verzi nenasadí a nechá běžet poslední funkční.
 
 GitHub Pages můžeš nechat běžet jako zálohu. Lidem ale posílej jen novou adresu.
