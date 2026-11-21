@@ -1,9 +1,16 @@
 // Nastavení pro Cloudflare: web je hotová statická stránka ve složce dist.
 // Díky tomuhle souboru se Cloudflare nesnaží projekt nastavovat sám.
+//
+// src/worker.js obsluhuje jen data/latest.json: když v něm chybí
+// zítřejší ceny (GitHub Actions chodí pozdě), doplní je rovnou z OTE.
+// Všechno ostatní jde přímo ze složky dist, Worker se ani nespustí.
 {
   "name": "kdyzapnout",
   "compatibility_date": "2026-10-01",
+  "main": "src/worker.js",
   "assets": {
-    "directory": "./dist"
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "run_worker_first": ["/data/latest.json"]
   }
 }
